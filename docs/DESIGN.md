@@ -1,0 +1,222 @@
+# ADS-B 統合解析・DB登録システム 実装仕様書
+
+## 1. システム概要
+
+本システムは、複数センサーからAMQP経由で受信するADS-B/Mode-S生データ（100ns精度のタイムスタンプ付きビット列）を統合・重複排除・デコードし、指定された時間分解能（ダウンサンプリング）でPostgreSQLへ登録するRust製バックエンドアプリケーションである。
+
+* **言語・制約**: Pure Rust (C/C++依存禁止)。Windows/Linux両対応。
+* **主要クレート**: `tokio` (非同期ランタイム), `lapin` (AMQP), `sqlx` (PostgreSQL), `rs1090` (Mode-S / ADS-B / FLARM デコードおよびCPR座標計算のコアライブラリ。**ステートレスな数学エンジンとして利用**し、状態管理は本アプリ側で保持する), `tracing` (ログ・可観測性)。
+* **稼働モード**:
+  1. **リアルタイムモード**: AMQPからストリーム受信。
+  2. **再計算モード**: 過去の1分毎ファイル（生バイト列ログ）から読み込み（冪等性を担保したDB再構築）。
+
+### 1.1. 前提条件
+
+* **クロック同期**: 全センサーは GPS 規律の UTC 時刻に同期している（相互誤差 < 数ms）。これにより TDOA 重複排除（ビット列＋時刻窓）が成立する。
+* **タイムスタンプ**: `timestamp_100ns` は **Unixエポック起点・100ナノ秒単位の i64**。`TIMESTAMPTZ` へは `timestamp_100ns × 100` ナノ秒 = UTC として変換する。
+
+### 1.2. 対象メッセージ種別 (Downlink Format)
+
+| DF | 内容 | フレーム長 | 抽出フィールド |
+|---|---|---|---|
+| DF17 / DF18 | ADS-B 拡張スキッタ | 112bit (`[u8;14]`) | 位置(BDS0,5/0,6)・便名(BDS0,8)・地上判定 |
+| DF5 / DF21 | Identity (Mode A code) | 56/112bit | スコーク（緊急含む） |
+| DF4 / DF20 | Altitude | 56/112bit | 気圧高度 |
+
+* 上記以外のDF、CRC（パリティ）不一致、パース不能なフレームは**破棄し、カウンタで計数**する。
+* DF4/5/20/21 の `mode_s_code`（ICAO 24bitアドレス）は AP（パリティ overlay）から rs1090 を用いて復元する。
+
+## 2. データベーススキーマ（PostgreSQL）
+
+UIアプリからの高速な `SELECT *` を実現するため、単一の `raw_adsb_records` テーブルに完全な状態スナップショットとして格納する。
+
+```sql
+CREATE TABLE raw_adsb_records (
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+    mode_s_code VARCHAR(6) NOT NULL,
+    lat DOUBLE PRECISION,
+    lon DOUBLE PRECISION,
+    alt INT,
+    call_sign VARCHAR(8),
+    squawk VARCHAR(4),
+    on_ground BOOLEAN NOT NULL,
+    CONSTRAINT uq_raw_records_modes_time UNIQUE (mode_s_code, timestamp)
+);
+CREATE INDEX idx_raw_records_time ON raw_adsb_records (timestamp);
+CREATE INDEX idx_raw_records_mode_s_time ON raw_adsb_records (mode_s_code, timestamp DESC);
+```
+
+* **行生成は「位置確定時のみ」**。`lat`/`lon` が得られた瞬間のみ行を生成し、その時点の最新メタデータ（`alt`/`call_sign`/`squawk`）をスナップショットとして焼き込む。
+* **`on_ground`**: 次のいずれかで `TRUE`。
+  * Surface position として取得した座標であるとき。
+  * DF17 メッセージの CA（Capability）== 4（on-ground）であるとき。
+  * DF18 は CA を持たない（CF）ため、surface 由来か否かのみで判定する。
+* **冪等性 (UPSERT)**: `(mode_s_code, timestamp)` の一意制約により、リアルタイム・再計算とも `INSERT ... ON CONFLICT (mode_s_code, timestamp) DO UPDATE` で冪等化する。`timestamp` はダウンサンプリングでブロック境界に丸められているため、機体×ブロックで一意になる。
+* **保持・パーティション**: 本アプリは過去データの削除を行わない（別アプリが読み出し・削除を管轄）。データ規模（最大 ~10万行/日・保持2週間で ~140万行）も小さいためパーティションは設けない。
+
+## 3. データパイプラインアーキテクチャ (Actor Model)
+
+各機能は独立したTokioタスク（Actor）として実装し、`mpsc::channel` で接続する。再計算時は入力元（Receiver）をFile Readerに差し替える設計とすること。
+
+`Receiver` ➔ `Watermark Aggregator` ➔ `Exact TTL Deduplicator` ➔ `State Manager & Decoder` ➔ `Downsampler` ➔ `DB Writer`
+
+### 3.1. ウォーターマークのインバンド伝播
+
+各チャネルが流すメッセージは列挙型とし、実データと「時刻が確定した」制御信号を同一チャネルで伝播させる。
+
+```rust
+enum PipelineMsg {
+    Event(/* 各段の実データ */),
+    Watermark(i64), // この時刻(100ns)まで完了した、を表す単調増加値
+}
+```
+
+* **時間駆動の出所をモード別に分離する**:
+  * **リアルタイム**: Aggregator が各センサー受信 `timestamp_100ns` の最小ウォーターマーク＋タイムアウトで `Watermark(T)` を生成（壁時計はタイムアウト判定のみに使用）。
+  * **再計算**: ファイル内データの `timestamp_100ns` のみが時間を駆動（壁時計非依存）。これにより `tokio::time::pause` による決定的テストと冪等性を両立する。
+
+## 4. 各コアモジュールの厳密な実装仕様
+
+### 4.0. AMQP Receiver & Payload Adapter (腐敗防止層)
+
+* **役割**: AMQPから受信したバイナリデータ（暫定フォーマット）をパースし、共通の内部構造体 `RawSensorEvent` に変換してから次段へ渡す。
+* **センサー識別**: `sensor_id` は **AMQP の routing key** から取得する（バイナリ仕様変更の影響を受けないため）。
+* **フレーム長判定**:
+  * 56bit メッセージは AMQP 上では末尾56bitがゼロパディングされた14バイトで届く。
+  * 長さ判定は **先頭5bitの DF 値**で行う（DF ∈ {4,5,11,...}→56bit、DF ∈ {17,18,20,21,...}→112bit）。
+  * 短フレーム判定時は「末尾56bitがゼロであること」を**整合性チェック**として併用し、ゼロでなければ不正として計数破棄する。
+* **内部ドメインモデル**:
+
+```rust
+pub enum ModeSFrame {
+    Short([u8; 7]),  // 56bit
+    Long([u8; 14]),  // 112bit
+}
+
+pub struct RawSensorEvent {
+    pub sensor_id: u16,        // AMQP routing key 由来
+    pub timestamp_100ns: i64,  // Unixエポック起点・100ns・GPS規律UTC
+    pub rssi_dbm: i16,
+    pub frame: ModeSFrame,
+}
+```
+
+* **隔離設計**: バイナリフォーマットの構造（エンディアン、ヘッダサイズ、フィールド順序、ゼロパディング規約）に依存するコードは、このモジュール内に完全に閉じ込めること。後続パイプラインは必ず `RawSensorEvent` を受け取って処理する。
+* **AMQP 消費セマンティクス**:
+  * `RawSensorEvent` への変換・チャネル投入が完了した時点で **ack**（取りこぼしは許容、二重時は UPSERT が吸収）。
+  * prefetch (QoS) を設定しバックプレッシャを掛ける（既定 1000）。
+  * 接続断は指数バックオフで自動再接続する。
+
+### 4.1. Watermark Aggregator (Tick制御)
+
+* **役割**: 各センサーからの1秒毎のデータをバッファリングし、「時刻T」の完了を判定して `Watermark(T)` を次段へ送る。
+* **センサー集合**: 起動時引数 `--sensors` で**静的に宣言**する。未宣言の `sensor_id` が来た場合は警告ログ＋計数。
+* **完了条件**: 宣言された全センサーの最新受信時刻（ウォーターマーク）が時刻Tを超えた場合。または一部センサーの遅延がタイムアウト閾値（`--watermark-timeout-ms`）を超過した場合は、当該センサーを除外して前進する。
+
+### 4.2. Exact TTL Deduplicator (重複排除)
+
+* **役割**: 空間伝播遅延（TDOA）による同一メッセージの重複を排除する（Tick跨ぎ対応）。**先着データのみ**を次段へ流す（信号強度比較は行わない）。
+* **アルゴリズム**:
+  * メッセージの生ビット列（`ModeSFrame`）をキーとする。ModeSCode は使用しない。
+  * `HashSet<ModeSFrame>` を用いて $O(1)$ で先着判定。先着データのみ次段へ流す。
+  * `BTreeMap<i64, Vec<ModeSFrame>>` を用いて有効期限（既定 `--dedup-ttl-ms` = 50ms）を管理する。`Watermark(T)` 受信時に `T - TTL` 以前のビット列を HashSet からパージする。
+
+### 4.3. Aircraft State Manager (状態保持とCPR計算)
+
+* **役割**: CPR（Odd/Even）のペアリングと、メタデータの状態マージを行う。
+* **CPR 状態所有（流儀A）**: 機体ごとに直近の even/odd メッセージを**自作キャッシュで保持**し、rs1090 の**ステートレス関数**を呼び出す。
+  * 空中: `airborne_position(even, odd)`（グローバル復号）。
+  * 地上: `surface_position_with_reference(msg, ref)`（参照座標は `--surface-ref-lat/lon` で設定注入、45NM以内）。
+  * **空中はグローバル復号（even/odd ペア確立）が取れるまで座標を出力しない**。
+  * rs1090 は I/O を持たないステートレスな数学エンジンとして扱い、状態管理はすべて本マネージャが持つ。
+* **スナップショット保持フィールドと更新規則**:
+
+  | フィールド | 保持 | 更新規則 |
+  |---|---|---|
+  | `call_sign` | スナップショット | **N-Strikeデバウンス** |
+  | `squawk` | スナップショット | **N-Strikeデバウンス＋緊急即時** |
+  | `alt`（気圧高度） | スナップショット | **Last-Write-Wins（即時・デバウンス無し）** |
+  | `lat`/`lon` | Odd/Evenキャッシュ | グローバル復号で確定 |
+  | `on_ground` | 非保持 | 位置確定行ごとに算出 |
+
+* **メタデータのデバウンス（N-Strikeルール）** — `call_sign` と `squawk` のみに適用:
+  * 現在の確定値と異なる新候補値が**途切れず連続N回**（既定 `--debounce-n` = 3）受信された場合のみ上書き更新する。途中に別値が割り込んだらカウンタはその値用にリセットする。
+  * `call_sign` と `squawk` は**独立した候補カウンタ**を持つ。
+  * 確定済みの値と同じ値の再受信はカウンタに無関係（無視）。
+  * **緊急Squawk (`7700`, `7600`, `7500`)** は1回受信で即時確定（閾値無視・カウンタリセット）。緊急状態の**解除**（通常スコークへの復帰）は通常のN-Strike規則に従う。
+* **`alt`**: 連続変化する量のためデバウンスせず、最新値で即時上書き（Last-Write-Wins）。
+
+### 4.4. Downsampler (時間ブロック集約)
+
+* **役割**: 高頻度な座標データを、指定された時間ブロック（ミリ秒）に丸め、DB書き込み量を削減する。
+* **初期化バリデーション**: ブロックサイズ `S`（`--block-size-ms`）は起動時引数で指定。次をすべて満たさなければ起動時パニック。
+  * `S <= 1000` の場合、`1000 % S == 0`。
+  * `S > 1000` の場合、`S % 1000 == 0`。
+  * **加えて常に `60000 % S == 0`**（ブロックが1分ファイル境界を跨がず、再計算の1分単位 DELETE→INSERT と整合させるため）。
+* **集約アルゴリズム**:
+  * 絶対時間のブロックID `block_id = timestamp_100ns / (S * 10_000)` を算出。行の `timestamp` はブロック境界に丸める。
+  * `HashMap<(ModeSCode, BlockID), Record>` を使用し「最終値上書き（Last-Write-Wins）」で更新する。`Watermark(T)` 受信時に、終端が `T` 以前のブロックIDを DB Writer へフラッシュする。
+
+### 4.5. DB Writer (マイクロバッチ登録)
+
+* **役割**: `sqlx` を用いたバルク UPSERT。
+* **バッチ**: 「**500件 または 1秒**のどちらか先」でフラッシュ。`INSERT ... VALUES (...),(...) ON CONFLICT (mode_s_code, timestamp) DO UPDATE`（COPY は ON CONFLICT 非対応のため複数行 INSERT を使用）。プールは小さく設定（max 5）。
+* **再計算時の冪等性**: 1分ファイル単位で、対象1分（`[T, T+60s)`）のレコードを全機体まとめて `DELETE` し、その後 `INSERT` するトランザクションを実行する（各1分を独立トランザクションでコミット）。
+
+## 5. 再計算モード（Batch）の特殊起動シーケンス
+
+再計算は **レンジ指定**（`--recompute-from <UTC> --recompute-to <UTC>`、分精度）。CPRの欠落やTDOAの重複漏れを防ぐため、以下のウォームアップを厳密に実装する。ウォームアップはレンジ先頭で1回のみ行う。
+
+1. **フェーズ1（DBからの状態復元）**: 対象開始時刻から `--restore-lookback-seconds` 秒遡って観測された全機体の最新 `call_sign`, `squawk` を DB から取得し、`AircraftStateManager` を初期化する。
+   * 注: 進行中の N-Strike カウンタは復元されないが、フェーズ2のプレランニングで収束するため実用上問題ない。
+2. **フェーズ2（1分前ファイルのプレランニング）**: 対象開始時刻の「1分前」のファイルをデコーダーパイプラインに流す。このフェーズ中は DB Writer への送信を **MUTE（破棄）** し、メモリ状態（CPR の Odd/Even キャッシュや Deduplicator の HashSet）を温めることのみを行う。
+3. **フェーズ3（本処理）**: 対象開始時刻に入った瞬間に DB Writer を **UNMUTE** し、各1分を独立トランザクションで DELETE→INSERT する。
+* **ファイル特定**: `--data-dir` 配下の `YYYYMMDDHHmm.bin`（UTC）。欠損ファイルは警告計数してスキップする（その分は DELETE のみ実行され DB 上は空になる）。
+
+## 6. 起動引数一覧
+
+| 引数 | 用途 | 既定 |
+|---|---|---|
+| `--mode realtime\|recompute` | 稼働モード | — |
+| `--sensors <id:key,...>` | 静的センサー集合（id と routing key の対応） | — |
+| `--amqp-url` | AMQP 接続先 | — |
+| `--db-url` | PostgreSQL 接続先 | — |
+| `--block-size-ms <S>` | ダウンサンプリングブロック（ms） | — |
+| `--dedup-ttl-ms` | Dedup TTL | 50 |
+| `--watermark-timeout-ms` | 遅延センサー除外閾値 | — |
+| `--debounce-n` | N-Strike 回数 | 3 |
+| `--surface-ref-lat` / `--surface-ref-lon` | 地上CPR参照座標（設定注入） | — |
+| `--recompute-from` / `--recompute-to <UTC>` | 再計算レンジ（分精度） | — |
+| `--restore-lookback-seconds` | フェーズ1遡及秒 | — |
+| `--data-dir` | 生バイトログ格納ディレクトリ | — |
+
+## 7. 実装の優先順位とテスト要件
+
+1. **Decoder & CPRロジック**: I/Oを持たない純粋関数として `decode`/`cpr` モジュールに隔離し、単体テストを徹底する。rs1090 はステートレスに利用する。
+2. **Deduplicator & Downsampler**: メモリリークがないこと、Tick進行に伴うパージ・フラッシュ処理が正しく動くことを仮想時間（`tokio::time::pause`）を用いてテストする。
+3. **Actor結合**: 最後にチャネルで各タスクを接続し、統合テストを行う。
+
+## 8. 可観測性
+
+`tracing` でログ出力する。最低限、以下の破棄・処理カウンタを記録する（Prometheus 等のエクスポータは初期スコープ外）。
+
+* `rejected_crc`（CRC不一致）
+* `unsupported_df`（対象外DF）
+* `malformed_short_frame`（末尾56bit非ゼロ等の不整合）
+* `dropped_late`（タイムアウト確定後に到着した遅延データ）
+* `unknown_sensor`（未宣言 sensor_id）
+* 処理レート・DB書込（UPSERT）件数
+
+## 9. クレート構成
+
+単一バイナリ＋モジュール分割。
+
+* `domain` — `RawSensorEvent` / `ModeSFrame` / `PipelineMsg` 等の内部ドメインモデル。
+* `config` — 起動引数パース・バリデーション。
+* `decode` / `cpr` — I/O 非依存の純粋関数群（rs1090 ラッパ・CPR）。単体テスト対象。
+* `receiver` — AMQP Receiver＋腐敗防止層／再計算時の File Reader。
+* `aggregator` — Watermark Aggregator。
+* `dedup` — Exact TTL Deduplicator。
+* `state` — Aircraft State Manager（CPRキャッシュ・N-Strike）。
+* `downsampler` — 時間ブロック集約。
+* `writer` — DB Writer（UPSERT・再計算トランザクション）。

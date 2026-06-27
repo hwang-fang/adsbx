@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT ON (mode_s_code)\n                   mode_s_code AS \"mode_s_code!\", call_sign, squawk\n               FROM raw_adsb_records\n               WHERE timestamp >= $1 AND timestamp < $2\n               ORDER BY mode_s_code, timestamp DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "mode_s_code!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "call_sign",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "squawk",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "ec9eb6c85c41d43c87c7f19c4035e20282bc8207b37a63585d87272622b65622"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM raw_adsb_records WHERE timestamp >= $1 AND timestamp < $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "603c76fdcb139637460584626b2844bc05311cee575bdf08197cab07caf409af"
+}
