@@ -6,15 +6,20 @@ use crate::metrics::Metrics;
 use crate::wire::{self, FrameReject, FILE_RECORD_LEN};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicQosOptions};
+use lapin::options::{
+    BasicAckOptions, BasicConsumeOptions, BasicQosOptions, ExchangeDeclareOptions,
+    QueueBindOptions, QueueDeclareOptions,
+};
 use lapin::types::FieldTable;
-use lapin::{Connection, ConnectionProperties};
+use lapin::{Connection, ConnectionProperties, ExchangeKind};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
-/// 消費するキュー名（AMQP トポロジは暫定。実環境に合わせて差し替える）。
+/// AMQP トポロジ（暫定。実環境に合わせて差し替える）。
+/// receiver は起動時にこれらを冪等に宣言・束縛する。
+const EXCHANGE: &str = "adsb";
 const QUEUE: &str = "adsb_raw";
 
 /// AMQP からストリーム受信し、パイプライン入口へ投入する。`tx` がクローズするか
@@ -36,6 +41,8 @@ pub async fn run_amqp(
         .basic_qos(cfg.prefetch, BasicQosOptions::default())
         .await
         .context("basic_qos")?;
+
+    declare_topology(&channel, cfg).await?;
 
     let mut consumer = channel
         .basic_consume(
@@ -77,6 +84,60 @@ pub async fn run_amqp(
             }
         }
     }
+    Ok(())
+}
+
+/// 起動時に AMQP トポロジを冪等に宣言する。
+///
+/// * exchange `adsb` (direct, durable) — bind の前提として宣言する。
+/// * queue `adsb_raw` (durable) — 本 consumer の占有キュー。
+/// * config の各 sensor routing key で queue を exchange に束縛する。
+///
+/// 宣言は冪等。既存と同一引数なら無害、引数が食い違う場合のみエラー（早期検知）。
+async fn declare_topology(channel: &lapin::Channel, cfg: &Config) -> Result<()> {
+    channel
+        .exchange_declare(
+            EXCHANGE,
+            ExchangeKind::Direct,
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .context("exchange_declare")?;
+
+    channel
+        .queue_declare(
+            QUEUE,
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .context("queue_declare")?;
+
+    for routing_key in cfg.routing_to_sensor.keys() {
+        channel
+            .queue_bind(
+                QUEUE,
+                EXCHANGE,
+                routing_key,
+                QueueBindOptions::default(),
+                FieldTable::default(),
+            )
+            .await
+            .with_context(|| format!("queue_bind {routing_key}"))?;
+    }
+
+    let mut keys: Vec<&String> = cfg.routing_to_sensor.keys().collect();
+    keys.sort();
+    info!(
+        "declared AMQP topology: exchange={EXCHANGE} queue={QUEUE} bindings={keys:?}"
+    );
     Ok(())
 }
 
