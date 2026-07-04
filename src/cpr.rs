@@ -53,8 +53,16 @@ mod tests {
         let m1 = airborne("8D40058B58C901375147EFD09357");
         let m2 = airborne("8D40058B58C904A87F402D3B8C59");
         let pos = global_airborne(&m1, &m2).expect("global decode");
-        assert!((pos.latitude - 49.81755).abs() < 1e-3, "lat={}", pos.latitude);
-        assert!((pos.longitude - 6.08442).abs() < 1e-3, "lon={}", pos.longitude);
+        assert!(
+            (pos.latitude - 49.81755).abs() < 1e-3,
+            "lat={}",
+            pos.latitude
+        );
+        assert!(
+            (pos.longitude - 6.08442).abs() < 1e-3,
+            "lon={}",
+            pos.longitude
+        );
     }
 
     #[test]

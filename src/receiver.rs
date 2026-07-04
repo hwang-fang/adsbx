@@ -179,9 +179,7 @@ async fn declare_topology(channel: &lapin::Channel, cfg: &Config) -> Result<()> 
 
     let mut keys: Vec<&String> = cfg.routing_to_sensor.keys().collect();
     keys.sort();
-    info!(
-        "declared AMQP topology: exchange={EXCHANGE} queue={QUEUE} bindings={keys:?}"
-    );
+    info!("declared AMQP topology: exchange={EXCHANGE} queue={QUEUE} bindings={keys:?}");
     Ok(())
 }
 

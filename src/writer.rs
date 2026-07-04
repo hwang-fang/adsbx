@@ -6,7 +6,7 @@ use crate::time::Ts100ns;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, QueryBuilder, Postgres};
+use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::sync::Arc;
 
 /// 複数行 INSERT の 1 文あたり最大行数。PostgreSQL の bind パラメータ上限
@@ -17,7 +17,8 @@ const MAX_ROWS_PER_INSERT: usize = 5000;
 pub fn to_datetime(ts: Ts100ns) -> DateTime<Utc> {
     let secs = ts.0.div_euclid(10_000_000);
     let nanos = (ts.0.rem_euclid(10_000_000) * 100) as u32;
-    DateTime::from_timestamp(secs, nanos).unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
+    DateTime::from_timestamp(secs, nanos)
+        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
 }
 
 #[derive(Clone)]
@@ -66,7 +67,10 @@ impl DbWriter {
         for chunk in rows.chunks(MAX_ROWS_PER_INSERT) {
             let mut qb = QueryBuilder::new("");
             Self::push_insert(&mut qb, chunk);
-            qb.build().execute(&self.pool).await.context("upsert batch")?;
+            qb.build()
+                .execute(&self.pool)
+                .await
+                .context("upsert batch")?;
             Metrics::add(&self.metrics.db_upserts, chunk.len() as u64);
         }
         Ok(())
@@ -94,7 +98,10 @@ impl DbWriter {
         for chunk in rows.chunks(MAX_ROWS_PER_INSERT) {
             let mut qb = QueryBuilder::new("");
             Self::push_insert(&mut qb, chunk);
-            qb.build().execute(&mut *tx).await.context("insert minute rows")?;
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .context("insert minute rows")?;
         }
 
         tx.commit().await.context("commit recompute tx")?;

@@ -8,9 +8,9 @@ use crate::config::Config;
 use crate::domain::{PositionRecord, RawSensorEvent};
 use crate::engine::Engine;
 use crate::metrics::Metrics;
+use crate::receiver;
 use crate::time::{self, now_100ns, Ts100ns};
 use crate::writer::{to_datetime, DbWriter};
-use crate::receiver;
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, Utc};
 use std::collections::HashMap;
@@ -194,7 +194,14 @@ pub async fn run_recompute(cfg: Config, metrics: Arc<Metrics>) -> Result<()> {
             collect(&mut buckets, engine.process(ev), from, to);
         }
         info!("phase3: fed {} records from {}", n, fmt_minute(m));
-        write_ready_minutes(&writer, &mut buckets, &mut next_write, to, engine.confirmed()).await?;
+        write_ready_minutes(
+            &writer,
+            &mut buckets,
+            &mut next_write,
+            to,
+            engine.confirmed(),
+        )
+        .await?;
         m += ChronoDuration::minutes(1);
     }
 
@@ -235,7 +242,11 @@ async fn write_ready_minutes(
     {
         let rows = buckets.remove(&minute_key(*next_write)).unwrap_or_default();
         writer.recompute_minute(*next_write, &rows).await?;
-        info!("wrote minute {} ({} rows)", fmt_minute(*next_write), rows.len());
+        info!(
+            "wrote minute {} ({} rows)",
+            fmt_minute(*next_write),
+            rows.len()
+        );
         *next_write += ChronoDuration::minutes(1);
     }
     Ok(())

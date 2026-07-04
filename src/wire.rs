@@ -50,10 +50,7 @@ pub fn parse_frame(payload: &[u8; PAYLOAD_LEN]) -> Result<ModeSFrame, FrameRejec
 }
 
 /// AMQP body をパースする。sensor_id は呼び出し側が routing key から与える。
-pub fn parse_amqp_body(
-    sensor_id: u16,
-    body: &[u8],
-) -> Result<RawSensorEvent, FrameReject> {
+pub fn parse_amqp_body(sensor_id: u16, body: &[u8]) -> Result<RawSensorEvent, FrameReject> {
     if body.len() != AMQP_BODY_LEN {
         return Err(FrameReject::BadLength);
     }

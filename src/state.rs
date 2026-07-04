@@ -82,10 +82,7 @@ impl AircraftStateManager {
 
     /// 1 イベントを処理する。位置が確定した場合のみ [`PositionRecord`] を返す。
     /// デコード不能なら破棄理由を `Err` で返す（呼び出し側がカウンタ計上）。
-    pub fn process(
-        &mut self,
-        ev: &RawSensorEvent,
-    ) -> Result<Option<PositionRecord>, DecodeReject> {
+    pub fn process(&mut self, ev: &RawSensorEvent) -> Result<Option<PositionRecord>, DecodeReject> {
         let decoded = decode_frame(&ev.frame)?;
         let icao = decoded.icao;
         let n = self.debounce_n;
@@ -233,7 +230,9 @@ mod tests {
     fn airborne_emits_record_only_after_global_pair() {
         let mut mgr = AircraftStateManager::new(3, None);
         // 1 通目（even）では確定しない。
-        let r1 = mgr.process(&ev("8D40058B58C901375147EFD09357", 1000)).unwrap();
+        let r1 = mgr
+            .process(&ev("8D40058B58C901375147EFD09357", 1000))
+            .unwrap();
         assert!(r1.is_none());
         // 2 通目（odd, 新鮮）でグローバル復号 -> レコード生成。
         let r2 = mgr

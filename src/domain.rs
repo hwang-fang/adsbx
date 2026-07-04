@@ -23,7 +23,6 @@ impl ModeSFrame {
             ModeSFrame::Long(b) => b,
         }
     }
-
 }
 
 /// 腐敗防止層を通過した後の共通内部イベント。

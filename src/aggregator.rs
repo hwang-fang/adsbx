@@ -99,7 +99,10 @@ mod tests {
         a.observe(2, Ts100ns(10_000_000));
         // sensor1 が 100s まで前進、sensor2 は 10s で停止（90s 遅延 > 1s）。
         // sensor2 は除外され、watermark は sensor1 基準で 100s へ。
-        assert_eq!(a.observe(1, Ts100ns(100_000_000)), Some(Ts100ns(100_000_000)));
+        assert_eq!(
+            a.observe(1, Ts100ns(100_000_000)),
+            Some(Ts100ns(100_000_000))
+        );
     }
 
     #[test]

@@ -200,7 +200,9 @@ mod tests {
 
     #[test]
     fn accepts_valid_block_sizes() {
-        for s in [1, 2, 4, 5, 10, 20, 50, 100, 200, 250, 500, 1000, 2000, 5000, 30_000, 60_000] {
+        for s in [
+            1, 2, 4, 5, 10, 20, 50, 100, 200, 250, 500, 1000, 2000, 5000, 30_000, 60_000,
+        ] {
             assert!(validate_block_size(s).is_ok(), "S={s} should be valid");
         }
     }

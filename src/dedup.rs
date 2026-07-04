@@ -37,7 +37,9 @@ impl Deduplicator {
     pub fn purge(&mut self, watermark: Ts100ns) {
         // split_off(&k) は k 以降を残すので、k = watermark+1 で「<= watermark」を取り出す。
         // 終端の Ts100ns::MAX でも飽和して溢れない。
-        let mut expired = self.expiry.split_off(&watermark.saturating_add(Dur100ns(1)));
+        let mut expired = self
+            .expiry
+            .split_off(&watermark.saturating_add(Dur100ns(1)));
         std::mem::swap(&mut expired, &mut self.expiry);
         for (_, frames) in expired {
             for f in frames {
