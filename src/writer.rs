@@ -2,16 +2,21 @@
 
 use crate::domain::{mode_s_hex, PositionRecord};
 use crate::metrics::Metrics;
+use crate::time::Ts100ns;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, QueryBuilder, Postgres};
 use std::sync::Arc;
 
-/// Unix エポック起点 100ns 値を UTC 日時へ変換する。
-pub fn to_datetime(timestamp_100ns: i64) -> DateTime<Utc> {
-    let secs = timestamp_100ns.div_euclid(10_000_000);
-    let nanos = (timestamp_100ns.rem_euclid(10_000_000) * 100) as u32;
+/// 複数行 INSERT の 1 文あたり最大行数。PostgreSQL の bind パラメータ上限
+/// （65,535 個）に対し 8 パラメータ × 5,000 = 40,000 で余裕を持たせる。
+const MAX_ROWS_PER_INSERT: usize = 5000;
+
+/// 100ns 時刻を UTC 日時へ変換する。
+pub fn to_datetime(ts: Ts100ns) -> DateTime<Utc> {
+    let secs = ts.0.div_euclid(10_000_000);
+    let nanos = (ts.0.rem_euclid(10_000_000) * 100) as u32;
     DateTime::from_timestamp(secs, nanos).unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
 }
 
@@ -38,7 +43,7 @@ impl DbWriter {
              (timestamp, mode_s_code, lat, lon, alt, call_sign, squawk, on_ground) ",
         );
         qb.push_values(rows, |mut b, r| {
-            b.push_bind(to_datetime(r.timestamp_100ns))
+            b.push_bind(to_datetime(r.ts))
                 .push_bind(mode_s_hex(r.mode_s_code))
                 .push_bind(r.lat)
                 .push_bind(r.lon)
@@ -55,15 +60,15 @@ impl DbWriter {
         );
     }
 
-    /// リアルタイム: バッチを UPSERT する。
+    /// リアルタイム: バッチを UPSERT する。bind 上限を超えないようチャンクして実行する
+    /// （チャンク間はトランザクションで括らないが、UPSERT は冪等なので途中失敗・再送に安全）。
     pub async fn upsert_batch(&self, rows: &[PositionRecord]) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
+        for chunk in rows.chunks(MAX_ROWS_PER_INSERT) {
+            let mut qb = QueryBuilder::new("");
+            Self::push_insert(&mut qb, chunk);
+            qb.build().execute(&self.pool).await.context("upsert batch")?;
+            Metrics::add(&self.metrics.db_upserts, chunk.len() as u64);
         }
-        let mut qb = QueryBuilder::new("");
-        Self::push_insert(&mut qb, rows);
-        qb.build().execute(&self.pool).await.context("upsert batch")?;
-        Metrics::add(&self.metrics.db_upserts, rows.len() as u64);
         Ok(())
     }
 
@@ -86,9 +91,9 @@ impl DbWriter {
         .await
         .context("delete minute range")?;
 
-        if !rows.is_empty() {
+        for chunk in rows.chunks(MAX_ROWS_PER_INSERT) {
             let mut qb = QueryBuilder::new("");
-            Self::push_insert(&mut qb, rows);
+            Self::push_insert(&mut qb, chunk);
             qb.build().execute(&mut *tx).await.context("insert minute rows")?;
         }
 
@@ -135,10 +140,10 @@ mod tests {
     #[test]
     fn converts_epoch_100ns_to_utc() {
         // 1_000_000_000 * 10_000_000 (100ns) = 1e9 秒 = 2001-09-09T01:46:40Z
-        let dt = to_datetime(1_000_000_000 * 10_000_000);
+        let dt = to_datetime(Ts100ns(1_000_000_000 * 10_000_000));
         assert_eq!(dt.timestamp(), 1_000_000_000);
         // 端数 100ns。
-        let dt2 = to_datetime(10_000_000 + 5); // 1.0000005 秒
+        let dt2 = to_datetime(Ts100ns(10_000_000 + 5)); // 1.0000005 秒
         assert_eq!(dt2.timestamp(), 1);
         assert_eq!(dt2.timestamp_subsec_nanos(), 500);
     }

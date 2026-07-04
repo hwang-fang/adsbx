@@ -6,10 +6,11 @@ mod decode;
 mod dedup;
 mod domain;
 mod downsampler;
+mod engine;
 mod metrics;
-mod pipeline;
 mod receiver;
 mod state;
+mod time;
 mod wire;
 mod writer;
 

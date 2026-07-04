@@ -14,6 +14,7 @@ pub struct Metrics {
     pub deduped_dropped: AtomicU64,
     pub positions_emitted: AtomicU64,
     pub db_upserts: AtomicU64,
+    pub amqp_reconnects: AtomicU64,
 }
 
 impl Metrics {
@@ -32,7 +33,8 @@ impl Metrics {
     pub fn snapshot(&self) -> String {
         format!(
             "rejected_crc={} parse_error={} unsupported_df={} malformed_short_frame={} \
-             dropped_late={} unknown_sensor={} deduped_dropped={} positions_emitted={} db_upserts={}",
+             dropped_late={} unknown_sensor={} deduped_dropped={} positions_emitted={} \
+             db_upserts={} amqp_reconnects={}",
             self.rejected_crc.load(Ordering::Relaxed),
             self.parse_error.load(Ordering::Relaxed),
             self.unsupported_df.load(Ordering::Relaxed),
@@ -42,6 +44,7 @@ impl Metrics {
             self.deduped_dropped.load(Ordering::Relaxed),
             self.positions_emitted.load(Ordering::Relaxed),
             self.db_upserts.load(Ordering::Relaxed),
+            self.amqp_reconnects.load(Ordering::Relaxed),
         )
     }
 }

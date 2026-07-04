@@ -7,12 +7,13 @@
 use crate::cpr::{global_airborne, local_surface};
 use crate::decode::{decode_frame, DecodeReject, DecodedKind};
 use crate::domain::{PositionRecord, RawSensorEvent};
+use crate::time::{Dur100ns, Ts100ns};
 use rs1090::decode::bds::bds05::AirbornePosition;
 use rs1090::decode::cpr::CPRFormat;
 use std::collections::HashMap;
 
 /// Odd/Even のペアリングを有効とみなす最大時間差（10 秒）。
-const PAIR_WINDOW_100NS: i64 = 10 * 10_000_000;
+const PAIR_WINDOW: Dur100ns = Dur100ns(10 * 10_000_000);
 
 /// N-Strike デバウンス対象フィールドの状態。
 #[derive(Default, Clone)]
@@ -50,8 +51,8 @@ impl Debounced {
 
 #[derive(Default)]
 struct AircraftState {
-    even: Option<(i64, AirbornePosition)>,
-    odd: Option<(i64, AirbornePosition)>,
+    even: Option<(Ts100ns, AirbornePosition)>,
+    odd: Option<(Ts100ns, AirbornePosition)>,
     call_sign: Debounced,
     squawk: Debounced,
     alt: Option<i32>,
@@ -109,13 +110,13 @@ impl AircraftStateManager {
                 None
             }
             DecodedKind::Airborne { pos, on_ground } => {
-                Self::handle_airborne(st, icao, ev.timestamp_100ns, pos, on_ground)
+                Self::handle_airborne(st, icao, ev.ts, pos, on_ground)
             }
             DecodedKind::Surface(sp) => match self.surface_ref {
                 Some((ref_lat, ref_lon)) => {
                     local_surface(&sp, ref_lat, ref_lon).map(|p| PositionRecord {
                         mode_s_code: icao,
-                        timestamp_100ns: ev.timestamp_100ns,
+                        ts: ev.ts,
                         lat: p.latitude,
                         lon: p.longitude,
                         alt: None, // 地上に気圧高度は無い
@@ -134,7 +135,7 @@ impl AircraftStateManager {
     fn handle_airborne(
         st: &mut AircraftState,
         icao: u32,
-        ts: i64,
+        ts: Ts100ns,
         pos: AirbornePosition,
         on_ground: bool,
     ) -> Option<PositionRecord> {
@@ -152,16 +153,16 @@ impl AircraftStateManager {
 
         // 反対 parity が新鮮なペアとして揃っていればグローバル復号。
         let (other_ts, other_pos) = other?;
-        if (ts - other_ts).abs() > PAIR_WINDOW_100NS {
+        if ts.abs_delta(other_ts) > PAIR_WINDOW {
             return None;
         }
         // rs1090 は第 2 引数を「最新」とみなしその位置を返す。現イベント `pos` を
-        // 最新として渡すことで、ev.timestamp 時点の座標を得る。
+        // 最新として渡すことで、ev.ts 時点の座標を得る。
         let position = global_airborne(&other_pos, &pos)?;
 
         Some(PositionRecord {
             mode_s_code: icao,
-            timestamp_100ns: ts,
+            ts,
             lat: position.latitude,
             lon: position.longitude,
             alt: pos.alt.map(|a| a as i32).or(st.alt),
@@ -186,7 +187,7 @@ mod tests {
         arr.copy_from_slice(&bytes);
         RawSensorEvent {
             sensor_id: 1,
-            timestamp_100ns: ts,
+            ts: Ts100ns(ts),
             rssi_dbm: -50,
             frame: ModeSFrame::Long(arr),
         }

@@ -1,7 +1,10 @@
 //! AMQP Receiver（リアルタイム）と再計算用ファイルリーダ。腐敗防止層 (`wire`) を介して
-//! 生バイト列を [`RawSensorEvent`] へ変換し、パイプラインへ投入する。
+//! 生バイト列を [`RawSensorEvent`] へ変換する。
+//!
+//! AMQP は接続断時に指数バックオフで自動再接続する（DESIGN §4.0）。
 
 use crate::config::Config;
+use crate::domain::RawSensorEvent;
 use crate::metrics::Metrics;
 use crate::wire::{self, FrameReject, FILE_RECORD_LEN};
 use anyhow::{Context, Result};
@@ -14,6 +17,7 @@ use lapin::types::FieldTable;
 use lapin::{Connection, ConnectionProperties, ExchangeKind};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -22,17 +26,57 @@ use tracing::{info, warn};
 const EXCHANGE: &str = "adsb";
 const QUEUE: &str = "adsb_raw";
 
-/// AMQP からストリーム受信し、パイプライン入口へ投入する。`tx` がクローズするか
-/// 接続が切れるまでブロックする。
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// 1 回の接続セッションの終わり方。
+enum SessionEnd {
+    /// パイプライン入口が閉じた（シャットダウン）。
+    InputClosed,
+    /// 接続確立後にストリームが終了した（接続断）。
+    ConnectionLost,
+}
+
+/// AMQP からストリーム受信し、パイプライン入口へ投入する。接続断・接続失敗は
+/// 指数バックオフ（1s→2s→…→30s 上限、確立成功でリセット）で自動再接続する。
+/// `tx` がクローズされたときのみ戻る。
 pub async fn run_amqp(
     cfg: &Config,
-    tx: mpsc::Sender<crate::domain::RawSensorEvent>,
+    tx: mpsc::Sender<RawSensorEvent>,
     metrics: Arc<Metrics>,
 ) -> Result<()> {
     let url = cfg
         .amqp_url
         .as_deref()
         .context("amqp_url required for realtime")?;
+
+    let mut backoff = INITIAL_BACKOFF;
+    loop {
+        match consume_session(url, cfg, &tx, &metrics).await {
+            Ok(SessionEnd::InputClosed) => return Ok(()),
+            Ok(SessionEnd::ConnectionLost) => {
+                warn!("AMQP connection lost");
+                backoff = INITIAL_BACKOFF; // 確立に成功していたのでリセット
+            }
+            Err(e) => warn!("AMQP session failed: {e:#}"),
+        }
+        if tx.is_closed() {
+            return Ok(());
+        }
+        Metrics::incr(&metrics.amqp_reconnects);
+        info!("reconnecting to AMQP in {backoff:?}");
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// 1 回の接続セッション: 接続 → トポロジ宣言 → 消費ループ。
+async fn consume_session(
+    url: &str,
+    cfg: &Config,
+    tx: &mpsc::Sender<RawSensorEvent>,
+    metrics: &Metrics,
+) -> Result<SessionEnd> {
     let conn = Connection::connect(url, ConnectionProperties::default())
         .await
         .context("AMQP connect")?;
@@ -70,11 +114,11 @@ pub async fn run_amqp(
                     // 変換・投入できた時点で ack（取りこぼし許容・重複は UPSERT が吸収）。
                     let _ = delivery.ack(BasicAckOptions::default()).await;
                     if tx.send(ev).await.is_err() {
-                        break;
+                        return Ok(SessionEnd::InputClosed);
                     }
                 }
                 Err(reject) => {
-                    count_frame_reject(&metrics, reject);
+                    count_frame_reject(metrics, reject);
                     let _ = delivery.ack(BasicAckOptions::default()).await;
                 }
             },
@@ -84,7 +128,7 @@ pub async fn run_amqp(
             }
         }
     }
-    Ok(())
+    Ok(SessionEnd::ConnectionLost)
 }
 
 /// 起動時に AMQP トポロジを冪等に宣言する。
@@ -141,18 +185,14 @@ async fn declare_topology(channel: &lapin::Channel, cfg: &Config) -> Result<()> 
     Ok(())
 }
 
-/// 1 分ファイル（生バイト列ログ）を読み、各レコードをパイプライン入口へ投入する。
-/// ファイルが存在しない場合は警告して 0 を返す（欠損スキップ）。
-pub async fn replay_file(
-    path: &Path,
-    tx: &mpsc::Sender<crate::domain::RawSensorEvent>,
-    metrics: &Metrics,
-) -> Result<usize> {
+/// 1 分ファイル（生バイト列ログ）を読み、パース済みイベント列を返す。
+/// ファイルが存在しない場合は警告して空を返す（欠損スキップ）。
+pub async fn read_minute_file(path: &Path, metrics: &Metrics) -> Result<Vec<RawSensorEvent>> {
     let data = match tokio::fs::read(path).await {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             warn!("recompute file missing, skipping: {}", path.display());
-            return Ok(0);
+            return Ok(Vec::new());
         }
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
@@ -166,19 +206,14 @@ pub async fn replay_file(
         );
     }
 
-    let mut count = 0;
+    let mut events = Vec::with_capacity(data.len() / FILE_RECORD_LEN);
     for chunk in data.chunks_exact(FILE_RECORD_LEN) {
         match wire::parse_file_record(chunk) {
-            Ok(ev) => {
-                if tx.send(ev).await.is_err() {
-                    break;
-                }
-                count += 1;
-            }
+            Ok(ev) => events.push(ev),
             Err(reject) => count_frame_reject(metrics, reject),
         }
     }
-    Ok(count)
+    Ok(events)
 }
 
 fn count_frame_reject(metrics: &Metrics, reject: FrameReject) {

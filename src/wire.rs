@@ -16,6 +16,7 @@
 //! payload は常に 14 バイト。56bit フレームは末尾 56bit がゼロ埋めされている。
 
 use crate::domain::{ModeSFrame, RawSensorEvent};
+use crate::time::Ts100ns;
 
 pub const PAYLOAD_LEN: usize = 14;
 pub const AMQP_BODY_LEN: usize = 8 + 2 + PAYLOAD_LEN; // 24
@@ -56,12 +57,12 @@ pub fn parse_amqp_body(
     if body.len() != AMQP_BODY_LEN {
         return Err(FrameReject::BadLength);
     }
-    let timestamp_100ns = i64::from_le_bytes(body[0..8].try_into().unwrap());
+    let ts = Ts100ns(i64::from_le_bytes(body[0..8].try_into().unwrap()));
     let rssi_dbm = i16::from_le_bytes(body[8..10].try_into().unwrap());
     let payload: [u8; PAYLOAD_LEN] = body[10..24].try_into().unwrap();
     Ok(RawSensorEvent {
         sensor_id,
-        timestamp_100ns,
+        ts,
         rssi_dbm,
         frame: parse_frame(&payload)?,
     })
@@ -73,12 +74,12 @@ pub fn parse_file_record(buf: &[u8]) -> Result<RawSensorEvent, FrameReject> {
         return Err(FrameReject::BadLength);
     }
     let sensor_id = u16::from_le_bytes(buf[0..2].try_into().unwrap());
-    let timestamp_100ns = i64::from_le_bytes(buf[2..10].try_into().unwrap());
+    let ts = Ts100ns(i64::from_le_bytes(buf[2..10].try_into().unwrap()));
     let rssi_dbm = i16::from_le_bytes(buf[10..12].try_into().unwrap());
     let payload: [u8; PAYLOAD_LEN] = buf[12..26].try_into().unwrap();
     Ok(RawSensorEvent {
         sensor_id,
-        timestamp_100ns,
+        ts,
         rssi_dbm,
         frame: parse_frame(&payload)?,
     })
@@ -126,7 +127,7 @@ mod tests {
         assert_eq!(body.len(), AMQP_BODY_LEN);
         let ev = parse_amqp_body(7, &body).unwrap();
         assert_eq!(ev.sensor_id, 7);
-        assert_eq!(ev.timestamp_100ns, 123_456_789);
+        assert_eq!(ev.ts, Ts100ns(123_456_789));
         assert_eq!(ev.rssi_dbm, -60);
 
         let mut rec = Vec::new();
@@ -135,7 +136,7 @@ mod tests {
         assert_eq!(rec.len(), FILE_RECORD_LEN);
         let ev2 = parse_file_record(&rec).unwrap();
         assert_eq!(ev2.sensor_id, 9);
-        assert_eq!(ev2.timestamp_100ns, 123_456_789);
+        assert_eq!(ev2.ts, Ts100ns(123_456_789));
     }
 
     #[test]

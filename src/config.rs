@@ -1,7 +1,7 @@
 //! 起動引数のパースとバリデーション。
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use clap::{Parser, ValueEnum};
 use std::collections::HashMap;
 
@@ -101,8 +101,13 @@ impl Config {
             let id: u16 = id_str
                 .parse()
                 .with_context(|| format!("invalid sensor id: {id_str}"))?;
-            sensors.insert(id, key.to_string());
-            routing_to_sensor.insert(key.to_string(), id);
+            // 重複は silent last-wins で双方向マップが非対称になるためエラー。
+            if sensors.insert(id, key.to_string()).is_some() {
+                bail!("duplicate sensor id in --sensors: {id}");
+            }
+            if routing_to_sensor.insert(key.to_string(), id).is_some() {
+                bail!("duplicate routing key in --sensors: {key}");
+            }
         }
         if sensors.is_empty() {
             bail!("--sensors must declare at least one sensor");
@@ -130,6 +135,9 @@ impl Config {
                 if to <= from {
                     bail!("--recompute-to must be after --recompute-from");
                 }
+                // 1分ファイル・分単位 DELETE 範囲・ブロック境界との整合のため分精度必須。
+                ensure_minute_aligned("--recompute-from", from)?;
+                ensure_minute_aligned("--recompute-to", to)?;
                 if cli.data_dir.is_none() {
                     bail!("--data-dir is required in recompute mode");
                 }
@@ -154,6 +162,14 @@ impl Config {
             prefetch: cli.prefetch,
         })
     }
+}
+
+/// 再計算レンジが分境界（秒・サブ秒 = 0）であることを検証する。
+fn ensure_minute_aligned(name: &str, dt: DateTime<Utc>) -> Result<()> {
+    if dt.second() != 0 || dt.nanosecond() != 0 {
+        bail!("{name} must be minute-aligned (seconds and sub-seconds must be zero): {dt}");
+    }
+    Ok(())
 }
 
 /// ブロックサイズ `S`(ms) の制約を検証する。
@@ -207,5 +223,63 @@ mod tests {
     #[test]
     fn rejects_zero() {
         assert!(validate_block_size(0).is_err());
+    }
+
+    fn base_cli() -> Cli {
+        Cli {
+            mode: Mode::Realtime,
+            sensors: vec!["1:a".into(), "2:b".into()],
+            amqp_url: Some("amqp://localhost".into()),
+            db_url: "postgres://localhost/adsbx".into(),
+            block_size_ms: 1000,
+            dedup_ttl_ms: 50,
+            watermark_timeout_ms: 1000,
+            debounce_n: 3,
+            surface_ref_lat: None,
+            surface_ref_lon: None,
+            recompute_from: None,
+            recompute_to: None,
+            restore_lookback_seconds: 0,
+            data_dir: None,
+            prefetch: 1000,
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_sensor_id() {
+        let mut cli = base_cli();
+        cli.sensors = vec!["1:a".into(), "1:b".into()];
+        assert!(Config::from_cli(cli).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_routing_key() {
+        let mut cli = base_cli();
+        cli.sensors = vec!["1:a".into(), "2:a".into()];
+        assert!(Config::from_cli(cli).is_err());
+    }
+
+    fn recompute_cli(from: &str, to: &str) -> Cli {
+        let mut cli = base_cli();
+        cli.mode = Mode::Recompute;
+        cli.amqp_url = None;
+        cli.data_dir = Some("/data".into());
+        cli.recompute_from = Some(from.parse().unwrap());
+        cli.recompute_to = Some(to.parse().unwrap());
+        cli
+    }
+
+    #[test]
+    fn rejects_non_minute_aligned_recompute_range() {
+        let cli = recompute_cli("2026-06-27T12:00:30Z", "2026-06-27T12:05:00Z");
+        assert!(Config::from_cli(cli).is_err());
+        let cli = recompute_cli("2026-06-27T12:00:00Z", "2026-06-27T12:05:59Z");
+        assert!(Config::from_cli(cli).is_err());
+    }
+
+    #[test]
+    fn accepts_minute_aligned_recompute_range() {
+        let cli = recompute_cli("2026-06-27T12:00:00Z", "2026-06-27T12:05:00Z");
+        assert!(Config::from_cli(cli).is_ok());
     }
 }

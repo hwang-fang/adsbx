@@ -54,26 +54,36 @@ CREATE INDEX idx_raw_records_mode_s_time ON raw_adsb_records (mode_s_code, times
 * **冪等性 (UPSERT)**: `(mode_s_code, timestamp)` の一意制約により、リアルタイム・再計算とも `INSERT ... ON CONFLICT (mode_s_code, timestamp) DO UPDATE` で冪等化する。`timestamp` はダウンサンプリングでブロック境界に丸められているため、機体×ブロックで一意になる。
 * **保持・パーティション**: 本アプリは過去データの削除を行わない（別アプリが読み出し・削除を管轄）。データ規模（最大 ~10万行/日・保持2週間で ~140万行）も小さいためパーティションは設けない。
 
-## 3. データパイプラインアーキテクチャ (Actor Model)
+## 3. 処理アーキテクチャ（同期コア + 非同期エッジ）
 
-各機能は独立したTokioタスク（Actor）として実装し、`mpsc::channel` で接続する。再計算時は入力元（Receiver）をFile Readerに差し替える設計とすること。
+処理の中核（Watermark Aggregator → Deduplicator → State Manager → Downsampler）はいずれも I/O を持たないメモリ内処理であるため、**単一の同期コア `Engine` に合成**する。並行処理（Tokioタスク）は I/O を持つ両端（AMQP Receiver / DB Writer）のみに置く。
 
-`Receiver` ➔ `Watermark Aggregator` ➔ `Exact TTL Deduplicator` ➔ `State Manager & Decoder` ➔ `Downsampler` ➔ `DB Writer`
-
-### 3.1. ウォーターマークのインバンド伝播
-
-各チャネルが流すメッセージは列挙型とし、実データと「時刻が確定した」制御信号を同一チャネルで伝播させる。
-
-```rust
-enum PipelineMsg {
-    Event(/* 各段の実データ */),
-    Watermark(i64), // この時刻(100ns)まで完了した、を表す単調増加値
-}
+```
+[AMQP Receiver task] ──mpsc──► [Engine 駆動ループ] ──mpsc──► [DB Writer task]
+                                └ 同期合成: aggregator → dedup → state → downsampler
 ```
 
+* `Engine::process(RawSensorEvent) -> Vec<PositionRecord>`: 1 イベントを同期処理し、確定した行を返す。
+* `Engine::finish() -> Vec<PositionRecord>`: 入力終端時に残存ブロックを全排出する。
+* 再計算時はチャネルを使わず、File Reader が読んだレコードを **Engine に直接同期供給**する（決定的で、仮想時間も不要）。
+* バックプレッシャは入口の有界チャネルと「コアが 1 件ずつ処理する」ことで成立する。
+* 中間段をタスク分割しない理由: 各段はマイクロ秒オーダーの軽量処理であり、パイプライン並列の利益よりチャネル越しの順序・終端の推論コストが上回るため。段が CPU バウンド化した場合に初めてタスク分割を再検討する。
+
+### 3.1. ウォーターマーク
+
+「時刻 T (100ns) まで完了した」を表す単調増加値。**チャネルメッセージではなく関数呼び出しで伝える**: aggregator が前進を返したとき、Engine が dedup のパージと downsampler のフラッシュを直接呼ぶ。イベント処理 → 確定処理の順序はコア内の逐次実行で自明に保証される。
+
 * **時間駆動の出所をモード別に分離する**:
-  * **リアルタイム**: Aggregator が各センサー受信 `timestamp_100ns` の最小ウォーターマーク＋タイムアウトで `Watermark(T)` を生成（壁時計はタイムアウト判定のみに使用）。
-  * **再計算**: ファイル内データの `timestamp_100ns` のみが時間を駆動（壁時計非依存）。これにより `tokio::time::pause` による決定的テストと冪等性を両立する。
+  * **リアルタイム**: 各センサー受信 `timestamp_100ns` の最小ウォーターマーク＋タイムアウトで前進（壁時計は定期ドレイン `advance_wallclock` のみに使用）。
+  * **再計算**: ファイル内データの `timestamp_100ns` のみが時間を駆動（壁時計非依存）。これにより決定的テストと冪等性を両立する。
+
+### 3.2. 確定処理の量子化
+
+ウォーターマークはイベント毎に前進し得るが、確定処理（dedup パージ・保留全ブロックの走査を伴う downsampler フラッシュ）を毎イベント実行すると高レート時に無駄が大きい。Engine は**前回確定時刻から `min(block_size, dedup_ttl)` 以上前進したときのみ**確定処理を実行する。量子化はデータ駆動なので再計算の決定性は保たれる。終端（`finish`）は無条件に確定する。
+
+### 3.3. 時間の型付け
+
+100ns 値の生 `i64` をモジュール間で受け渡さない。時刻 `Ts100ns` と幅 `Dur100ns` の newtype を `time` モジュールに定義し、ms → 100ns 換算と飽和演算をそこに閉じ込める。終端処理で `Ts100ns::MAX` 近傍の算術が発生するため、ウォーターマークに対する加減算は**型の実装として必ず飽和**させる（呼び出し側の注意に依存しない）。
 
 ## 4. 各コアモジュールの厳密な実装仕様
 
@@ -119,7 +129,7 @@ pub struct RawSensorEvent {
 * **アルゴリズム**:
   * メッセージの生ビット列（`ModeSFrame`）をキーとする。ModeSCode は使用しない。
   * `HashSet<ModeSFrame>` を用いて $O(1)$ で先着判定。先着データのみ次段へ流す。
-  * `BTreeMap<i64, Vec<ModeSFrame>>` を用いて有効期限（既定 `--dedup-ttl-ms` = 50ms）を管理する。`Watermark(T)` 受信時に `T - TTL` 以前のビット列を HashSet からパージする。
+  * `BTreeMap<Ts100ns, Vec<ModeSFrame>>` を用いて有効期限（既定 `--dedup-ttl-ms` = 50ms）を管理する。ウォーターマーク確定時に失効済みのビット列を HashSet からパージする。
 
 ### 4.3. Aircraft State Manager (状態保持とCPR計算)
 
@@ -155,12 +165,14 @@ pub struct RawSensorEvent {
   * **加えて常に `60000 % S == 0`**（ブロックが1分ファイル境界を跨がず、再計算の1分単位 DELETE→INSERT と整合させるため）。
 * **集約アルゴリズム**:
   * 絶対時間のブロックID `block_id = timestamp_100ns / (S * 10_000)` を算出。行の `timestamp` はブロック境界に丸める。
-  * `HashMap<(ModeSCode, BlockID), Record>` を使用し「最終値上書き（Last-Write-Wins）」で更新する。`Watermark(T)` 受信時に、終端が `T` 以前のブロックIDを DB Writer へフラッシュする。
+  * `HashMap<(ModeSCode, BlockID), Record>` を使用し「最終値上書き（Last-Write-Wins）」で更新する。ウォーターマーク確定時（§3.2 の量子化に従う）に、終端が確定時刻以前のブロックIDをフラッシュする。
 
 ### 4.5. DB Writer (マイクロバッチ登録)
 
 * **役割**: `sqlx` を用いたバルク UPSERT。
 * **バッチ**: 「**500件 または 1秒**のどちらか先」でフラッシュ。`INSERT ... VALUES (...),(...) ON CONFLICT (mode_s_code, timestamp) DO UPDATE`（COPY は ON CONFLICT 非対応のため複数行 INSERT を使用）。プールは小さく設定（max 5）。
+* **INSERT のチャンク化**: PostgreSQL の bind パラメータ上限（65,535 個 / 文）に達しないよう、複数行 INSERT は **1 文あたり最大 5,000 行**（8 パラメータ × 5,000 = 40,000）にチャンクする。再計算の 1 分 INSERT も同一トランザクション内でチャンクする。
+* **書き込み失敗時**: リアルタイムの UPSERT 失敗は短い間隔で**有界リトライ（3 回）**し、それでも失敗した場合はバッチを破棄してログ・計数する（取りこぼし許容の設計に整合。冪等キーにより再送しても安全）。
 * **再計算時の冪等性**: 1分ファイル単位で、対象1分（`[T, T+60s)`）のレコードを全機体まとめて `DELETE` し、その後 `INSERT` するトランザクションを実行する（各1分を独立トランザクションでコミット）。
 
 ## 5. 再計算モード（Batch）の特殊起動シーケンス
@@ -171,6 +183,7 @@ pub struct RawSensorEvent {
    * 注: 進行中の N-Strike カウンタは復元されないが、フェーズ2のプレランニングで収束するため実用上問題ない。
 2. **フェーズ2（1分前ファイルのプレランニング）**: 対象開始時刻の「1分前」のファイルをデコーダーパイプラインに流す。このフェーズ中は DB Writer への送信を **MUTE（破棄）** し、メモリ状態（CPR の Odd/Even キャッシュや Deduplicator の HashSet）を温めることのみを行う。
 3. **フェーズ3（本処理）**: 対象開始時刻に入った瞬間に DB Writer を **UNMUTE** し、各1分を独立トランザクションで DELETE→INSERT する。
+* **ストリーミング書き込み**: 出力を全量メモリに蓄積せず、**確定ウォーターマークが分終端を越えた分から順次** DELETE→INSERT する。ブロックは 1 分境界を跨がない（§4.4）ため、分終端 ≦ 確定ウォーターマークならその分の全レコードが排出済みであることが保証される。メモリ使用量はウォーターマーク遅延分に有界となり、途中失敗時も書き込み済みの分は完結している（再実行は冪等）。パイプライン終端で残りの分をまとめて書く（レコードの無い分も DELETE のみ実行してクリーンアップする）。
 * **ファイル特定**: `--data-dir` 配下の `YYYYMMDDHHmm.bin`（UTC）。欠損ファイルは警告計数してスキップする（その分は DELETE のみ実行され DB 上は空になる）。
 
 ## 6. 起動引数一覧
@@ -189,6 +202,12 @@ pub struct RawSensorEvent {
 | `--recompute-from` / `--recompute-to <UTC>` | 再計算レンジ（分精度） | — |
 | `--restore-lookback-seconds` | フェーズ1遡及秒 | — |
 | `--data-dir` | 生バイトログ格納ディレクトリ | — |
+
+**バリデーション規則**（起動時にエラーで停止）:
+
+* `--sensors` 内の sensor id・routing key の**重複はエラー**（silent last-wins による双方向マップの非対称を防ぐ）。
+* `--recompute-from` / `--recompute-to` は**分境界（秒・サブ秒 = 0）でなければエラー**（1分ファイル・分単位 DELETE 範囲・ブロック境界との整合のため）。
+* `--block-size-ms` は §4.4 の3条件。`--surface-ref-lat/lon` は両方同時指定のみ可。
 
 ## 7. 実装の優先順位とテスト要件
 
@@ -211,12 +230,14 @@ pub struct RawSensorEvent {
 
 単一バイナリ＋モジュール分割。
 
-* `domain` — `RawSensorEvent` / `ModeSFrame` / `PipelineMsg` 等の内部ドメインモデル。
+* `domain` — `RawSensorEvent` / `ModeSFrame` / `PositionRecord` 等の内部ドメインモデル。
+* `time` — `Ts100ns` / `Dur100ns` の時間 newtype（ms 換算・飽和演算を集約）。
 * `config` — 起動引数パース・バリデーション。
 * `decode` / `cpr` — I/O 非依存の純粋関数群（rs1090 ラッパ・CPR）。単体テスト対象。
-* `receiver` — AMQP Receiver＋腐敗防止層／再計算時の File Reader。
+* `receiver` — AMQP Receiver（再接続込み）＋腐敗防止層／再計算時の File Reader。
 * `aggregator` — Watermark Aggregator。
 * `dedup` — Exact TTL Deduplicator。
 * `state` — Aircraft State Manager（CPRキャッシュ・N-Strike）。
 * `downsampler` — 時間ブロック集約。
+* `engine` — 同期処理コア（aggregator→dedup→state→downsampler の合成、確定処理の量子化）。
 * `writer` — DB Writer（UPSERT・再計算トランザクション）。
