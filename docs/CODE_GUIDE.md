@@ -13,11 +13,12 @@
 ```
 リアルタイム:
 [AMQP] ──► receiver task ──mpsc──► Engine 駆動ループ ──mpsc──► writer task ──► [PostgreSQL]
-（腐敗防止層 wire で 24B → RawSensorEvent）   │
+（腐敗防止層 wire で ヘッダ+20Bレコード列 → RawSensorEvent）│
                                               └ 同期合成: aggregator → dedup → state → downsampler
 
 再計算（チャネルなし・完全同期）:
-[1分ファイル] ──► read_minute_file ──► Engine.process ──► 分バケット ──► recompute_minute
+[センサー毎1分ファイル.spkx] ──► read_sensor_minute_file ──► ts マージソート
+    ──► Engine.process ──► 分バケット ──► recompute_minute
 ```
 
 処理の中核（aggregator/dedup/state/downsampler）は **I/O を持たない同期コア `Engine`** に
@@ -77,6 +78,7 @@
 
 | 要素 | 役割 |
 |---|---|
+| `struct SensorId([u8;4])` | センサー識別子（英大文字2字+数字2字）。`from_ascii` で検証構築 |
 | `enum ModeSFrame { Short([u8;7]), Long([u8;14]) }` | Mode-S フレーム。56bit と 112bit を型で区別 |
 | `ModeSFrame::as_bytes()` | デコードに渡す生スライス |
 | `struct RawSensorEvent` | 腐敗防止層通過後の共通イベント（sensor_id / ts / rssi_dbm / frame） |
@@ -84,6 +86,7 @@
 | `fn mode_s_hex(u32) -> String` | ICAO 24bit → `"%06X"` 文字列（DB の `mode_s_code`） |
 
 **注意点**
+- `SensorId` は MQ ヘッダ／ファイル名由来の 4 文字コード。固定長 `Copy` なので aggregator の `HashMap` キーにそのまま使えます。旧実装の routing key 由来 `u16` から置き換わりました。
 - `ModeSFrame` が `Hash + Eq` を導出しているのは、**dedup の `HashSet` キーにそのまま使う**ためです。固定長配列なので `Copy` でき、所有権を気にせず使い回せます。
 - 旧実装にあった `Msg<T>`（インバンドウォーターマーク）は**廃止**。ウォーターマークは Engine 内の関数呼び出しになったため、チャネルを流れるのは実データのみです。
 
@@ -104,7 +107,7 @@
   1. `S <= 1000` なら `1000 % S == 0`
   2. `S > 1000` なら `S % 1000 == 0`
   3. **常に `60000 % S == 0`** ← これが肝。**ブロックが 1 分ファイル境界を跨がない**ことを保証し、再計算の「1 分単位 DELETE→INSERT」と整合させます。
-- `--sensors` の **id・routing key の重複はエラー**。silent last-wins だと `sensors`(id→key) と `routing_to_sensor`(key→id) の双方向マップが非対称になり、ウォーターマークが「存在するのにデータが来ないセンサー」を待ち続けるため。
+- `--sensors` は **4 文字コードのカンマ区切り**（例 `AB01,AB02`）。規約外（英大文字2字+数字2字でない）・重複はエラー。宣言済み集合は AMQP バインド・未宣言センサー検出・再計算のファイル列挙に使います。
 - `--recompute-from/to` は**分境界（秒・サブ秒 = 0）必須**。1 分ファイル名・分単位 DELETE 範囲・ブロック境界の三者と整合させるため。
 - `surface_ref` は lat/lon **両方揃って初めて** `Some`。片方だけはエラー。
 
@@ -114,17 +117,23 @@
 
 | 要素 | 役割 |
 |---|---|
-| 定数 `PAYLOAD_LEN=14` / `AMQP_BODY_LEN=24` / `FILE_RECORD_LEN=26` | 暫定フレーミングのサイズ |
-| `enum FrameReject { BadLength, MalformedShortFrame }` | 破棄理由 |
+| 定数 `PAYLOAD_LEN=14` / `RECORD_LEN=20` / `AMQP_HEADER_LEN=18` | フレーミングのサイズ |
+| `enum FrameReject { BadLength, MalformedShortFrame }` / `enum HeaderReject { BadLength, BadSensorId, BadTimestamp }` | 破棄理由 |
 | `fn parse_frame(&[u8;14])` | DF 値でフレーム長を判定し `ModeSFrame` 化 |
-| `fn parse_amqp_body(sensor_id, &[u8])` / `fn parse_file_record(&[u8])` | 生バイト列 → `RawSensorEvent` |
+| `fn signal_dbm(u16) -> i16` | 波高値 u16 → dBm デコード |
+| `fn parse_record(sensor_id, minute_start, &[u8])` | 20B レコード → 絶対時刻付き `RawSensorEvent` |
+| `fn parse_amqp_header(&[u8])` | MQ ヘッダ → `(sensor_id, 分頭, レコード列スライス)` |
+| `fn parse_minute(&str)`（内部） | `%Y%m%d%H%M%S` → UTC 分頭 |
 
 **注意点・工夫**
-- **AMQP のバイナリ仕様は「暫定」**。バイト順・オフセット・ゼロ埋め規約に依存するコードを**このファイルに完全に閉じ込めて**います。実フォーマット確定時はここだけ差し替えれば後続は無変更。
+- **バイナリ仕様依存はこのファイルに完全隔離**。レコード構造・ヘッダ・波高値エンコード・ゼロ埋め・ファイル名規則の変更はここだけ差し替えれば後続は無変更。
 - フレーム長は **先頭 5bit の DF 値**で判定（`df < 16` → 56bit短 / `>= 16` → 112bit長）。ゼロ埋めは**整合性チェック**（短フレームなのに末尾非ゼロ → `MalformedShortFrame`）として併用。
-- 暫定フレーミング（リトルエンディアン）:
-  - AMQP body = `[ts i64][rssi i16][payload 14B]` = 24B（sensor_id は routing key 由来）
-  - ファイル record = `[sensor_id u16][ts i64][rssi i16][payload 14B]` = 26B
+- フレーミング（リトルエンディアン）:
+  - **固定長レコード（20B）** = `[相対時刻 u32(分内100ns)][payload 14B][波高値 u16]`（MQ・ファイル共通）
+  - **MQ メッセージ** = `[sensor_id ASCII 4B][時刻 ASCII 14B]`（18B ヘッダ）+ 20B レコード × N。**絶対時刻 = ヘッダを分に切り捨てた分頭 + レコード相対時刻**。
+  - **保存ファイル** `{分}{sensor_id}.spkx` = 20B レコード列のみ（sensor_id・分頭はファイル名由来）。
+- **波高値のデコード**（`signal_dbm`）: 上位/下位 8bit がそれぞれ絶対値整数部/小数部のビット反転。`-(65535 - value)/256` で dBm 整数値（小数切り捨て）。範囲 -255〜0。
+- **分頭の切り出し**は `%Y%m%d%H%M%S` を**固定幅で手動スライス**（`chrono` の `%Y` 貪欲一致で連結文字列を誤読しないため）。秒は分頭算出で捨てる（レコードが分内相対のため）。
 
 ---
 
@@ -263,15 +272,16 @@
 |---|---|
 | `fn run_amqp(cfg, tx, metrics)` | 再接続ループ（指数バックオフ） |
 | `fn consume_session(...)`（内部） | 1 接続セッション: 接続→トポロジ宣言→消費 |
-| `fn declare_topology(channel, cfg)` | exchange/queue/binding の冪等宣言 |
-| `fn read_minute_file(path, metrics)` | 1 分ファイル → `Vec<RawSensorEvent>` |
+| `fn declare_topology(channel, cfg)` | exchange/queue/binding（センサーコード）の冪等宣言 |
+| `fn read_sensor_minute_file(path, sensor_id, minute_start, metrics)` | センサー毎1分ファイル → `Vec<RawSensorEvent>` |
 
 **重要ポイント・工夫**
 - **自動再接続**（DESIGN §4.0）: 接続失敗・接続断とも 1s→2s→…→30s 上限の指数バックオフで再試行。**接続確立に成功していたらバックオフをリセット**。`run_amqp` が戻るのはパイプライン入口（`tx`）が閉じたときだけです。
-- **トポロジ自前宣言**: 冪等なので毎回実行して無害、引数不一致時のみエラーで早期検知。まっさらなブローカーでもアプリ単体起動で消費可能。
-- **ack タイミング**: 変換・チャネル投入が成功した時点で ack（取りこぼし許容・二重時は UPSERT が吸収）。不正フレーム・未知センサーも ack して捨てる（再配送ループ防止）。
+- **メッセージ処理**: 1 メッセージ = ヘッダ + N レコード。ヘッダを `parse_amqp_header` で解析し、`sensor_id` が**宣言済み集合に含まれるか**を検証（未宣言 → `unknown_sensor`）。以降 `parse_record` で 20B ずつ複数イベントを投入。routing key は配送用（sensor_id はヘッダから取得）。
+- **トポロジ自前宣言**: 冪等・引数不一致時のみエラーで早期検知。binding はセンサーコードを routing key として張ります。
+- **ack タイミング**: ヘッダ受理（宣言済みセンサー）時点で ack し、その後レコード列を投入（取りこぼし許容・二重時は UPSERT が吸収）。ヘッダ不正・未宣言センサーは計数して ack 破棄（再配送ループ防止）。
 - `prefetch`(QoS) でバックプレッシャ。
-- `read_minute_file` は**欠損ファイルを警告して空を返しスキップ**。`chunks_exact(26)` で端数を無視。
+- `read_sensor_minute_file` は**欠損ファイルを警告して空を返しスキップ**。`chunks_exact(20)` で端数を無視（端数は警告）。sensor_id・分頭は呼び出し側（ファイル名）から与える。
 
 ---
 
@@ -302,15 +312,18 @@
 | `fn run_realtime(cfg, metrics)` | リアルタイム稼働 |
 | `fn writer_consumer` / `fn flush` | 500 件 or 1 秒のバッチ UPSERT（有界リトライ付き） |
 | `fn run_recompute(cfg, metrics)` | 再計算（3 フェーズ・ストリーミング書き込み） |
+| `fn read_minute_all_sensors` | 指定分の全センサーファイルを読み ts でマージソート |
 | `fn collect` / `fn write_ready_minutes` | 分バケット蓄積と確定分の順次書き出し |
+| `fn minute_path(dir, dt, sensor)` | `{分}{sensor}.spkx` パス生成 |
 
 **重要ポイント**
 - **リアルタイム**: receiver タスク（AMQP→`tx_in`）と writer タスク（`rx_db`→UPSERT）を spawn し、メインループが `select!` で「イベント受信 → `engine.process`」「ドレイン tick → `advance_wallclock`」「Ctrl-C」を捌く。終了時は receiver を止め、`engine.finish()` の残存行を writer に流してからドレイン。
 - **flush の有界リトライ**: 一時的な DB 障害に 3 回まで再試行（間 500ms）、使い切ったらバッチを破棄してログ（UPSERT 冪等なので再送安全・取りこぼし許容の設計に整合）。
 - **再計算はチャネルなしの完全同期ループ**。3 フェーズ:
   1. **フェーズ1**: `restore_states` で DB から確定メタデータをシード。
-  2. **フェーズ2**: 1 分前ファイルを `engine.process` に流して CPR/dedup を温める。出力は `collect` の `[from, to)` フィルタで自然に捨てられる（明示的な MUTE フラグ不要）。
+  2. **フェーズ2**: 1 分前の全センサーファイルを `engine.process` に流して CPR/dedup を温める。出力は `collect` の `[from, to)` フィルタで自然に捨てられる（明示的な MUTE フラグ不要）。
   3. **フェーズ3**: 対象レンジを 1 分ずつ投入し、**各分の投入後に `write_ready_minutes`** — 分終端 ≦ `engine.confirmed()` になった分から順次 `recompute_minute`（DELETE→INSERT）してバケットから除去。
+- **センサー毎ファイルのマージ**: 入力がセンサー毎 `.spkx` に分割されたため、`read_minute_all_sensors` が 1 分ぶんの全センサーファイルを読み、**絶対時刻でソート**してから投入します。センサー間で時刻が前後してもウォーターマークの単調性（遅延イベントの `dropped_late` 誤破棄）を防ぐためです。
 - **ストリーミング書き込みの保証**: ブロックは分境界を跨がない（config 保証）＋確定ウォーターマーク以前のブロックは排出済み（Engine 保証）なので、「分終端 ≦ confirmed」ならその分の全行が揃っています。メモリはウォーターマーク遅延分に有界で、途中失敗しても書き込み済みの分は完結（再実行は冪等）。
 - 終端は `engine.finish()` を回収後、`Ts100ns::MAX` で残り全分を書く（**欠損分の DELETE 含む**）。
 
@@ -319,7 +332,7 @@
 ## 16. `main.rs` / `examples/publish.rs`
 
 - `main.rs`: `tracing_subscriber` 初期化（`RUST_LOG`、既定 `info`）→ `Config` 検証 → モード分岐。
-- `examples/publish.rs`: トポロジ宣言＋既知の even/odd ペア（＋TDOA 重複）を暫定フォーマットで publish する検証補助。`SKIP_TOPOLOGY=1` / `DELETE_ONLY=1` で動作切替。
+- `examples/publish.rs`: トポロジ宣言＋既知の even/odd ペア（＋TDOA 重複）を新フォーマット（ヘッダ+20Bレコード）で publish する検証補助。`SKIP_TOPOLOGY=1` / `DELETE_ONLY=1` で動作切替。
 
 ---
 

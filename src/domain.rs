@@ -5,6 +5,46 @@
 
 use crate::time::Ts100ns;
 
+/// センサー識別子（英大文字2字 + 数字2字の 4 文字コード）。
+///
+/// MQ メッセージのヘッダ、または保存ファイル名に埋め込まれた 4 文字コードから得る。
+/// 固定長・`Copy` なので aggregator の `HashMap` キーにそのまま使える。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SensorId([u8; 4]);
+
+impl SensorId {
+    /// 4 バイトの ASCII（英大文字2字 + 数字2字）から構築する。規約外なら `None`。
+    pub fn from_ascii(bytes: &[u8]) -> Option<SensorId> {
+        let b: [u8; 4] = bytes.try_into().ok()?;
+        if b[0].is_ascii_uppercase()
+            && b[1].is_ascii_uppercase()
+            && b[2].is_ascii_digit()
+            && b[3].is_ascii_digit()
+        {
+            Some(SensorId(b))
+        } else {
+            None
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        // from_ascii を通っていれば必ず ASCII。
+        std::str::from_utf8(&self.0).unwrap_or("????")
+    }
+}
+
+impl std::fmt::Display for SensorId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Debug for SensorId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SensorId({:?})", self.as_str())
+    }
+}
+
 /// Mode-S フレーム。AMQP 上は 56bit メッセージも末尾 56bit ゼロ埋めの 14 バイトで
 /// 届くが、内部では DF 値から判定した本来の長さで保持する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -28,10 +68,11 @@ impl ModeSFrame {
 /// 腐敗防止層を通過した後の共通内部イベント。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawSensorEvent {
-    /// AMQP routing key 由来のセンサー識別子。
-    pub sensor_id: u16,
-    /// 受信時刻（GPS 規律 UTC）。
+    /// MQ ヘッダ／ファイル名由来のセンサー識別子。
+    pub sensor_id: SensorId,
+    /// 受信時刻（分頭 + レコード相対時刻。GPS 規律 UTC）。
     pub ts: Ts100ns,
+    /// 波高値をデコードした dBm（-255 ~ 0）。
     pub rssi_dbm: i16,
     pub frame: ModeSFrame,
 }

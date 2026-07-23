@@ -173,7 +173,7 @@ impl AircraftStateManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::ModeSFrame;
+    use crate::domain::{ModeSFrame, SensorId};
 
     fn ev(hex: &str, ts: i64) -> RawSensorEvent {
         let bytes: Vec<u8> = (0..hex.len())
@@ -183,7 +183,7 @@ mod tests {
         let mut arr = [0u8; 14];
         arr.copy_from_slice(&bytes);
         RawSensorEvent {
-            sensor_id: 1,
+            sensor_id: SensorId::from_ascii(b"AB01").unwrap(),
             ts: Ts100ns(ts),
             rssi_dbm: -50,
             frame: ModeSFrame::Long(arr),

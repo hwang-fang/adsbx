@@ -127,15 +127,17 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::config::Mode;
-    use crate::domain::ModeSFrame;
-    use std::collections::HashMap;
+    use crate::domain::{ModeSFrame, SensorId};
     use std::sync::atomic::Ordering;
+
+    fn sid(s: &str) -> SensorId {
+        SensorId::from_ascii(s.as_bytes()).unwrap()
+    }
 
     fn test_config() -> Config {
         Config {
             mode: Mode::Recompute,
-            sensors: HashMap::new(),
-            routing_to_sensor: HashMap::new(),
+            sensors: Vec::new(),
             amqp_url: None,
             db_url: String::new(),
             block_size_ms: 1000,
@@ -159,7 +161,7 @@ mod tests {
         let mut arr = [0u8; 14];
         arr.copy_from_slice(&bytes);
         RawSensorEvent {
-            sensor_id: 1,
+            sensor_id: sid("AB01"),
             ts: Ts100ns(ts),
             rssi_dbm: -50,
             frame: ModeSFrame::Long(arr),
@@ -201,7 +203,7 @@ mod tests {
 
         let a = ev(EVEN, 1_000_000);
         let mut b = a; // 同一ビット列を別センサーが少し遅れて受信
-        b.sensor_id = 2;
+        b.sensor_id = sid("AB02");
         b.ts = Ts100ns(1_200_000);
         e.process(a);
         e.process(b);

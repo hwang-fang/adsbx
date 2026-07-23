@@ -1,9 +1,10 @@
 //! 起動引数のパースとバリデーション。
 
+use crate::domain::SensorId;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Timelike, Utc};
 use clap::{Parser, ValueEnum};
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Mode {
@@ -18,7 +19,8 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub mode: Mode,
 
-    /// 静的センサー集合。`id:routing_key` をカンマ区切りで指定（例 `1:sensorA,2:sensorB`）。
+    /// 静的センサー集合。4 文字コード（英大文字2字+数字2字）をカンマ区切りで指定
+    /// （例 `AB01,AB02`）。
     #[arg(long, value_delimiter = ',')]
     pub sensors: Vec<String>,
 
@@ -70,10 +72,8 @@ pub struct Cli {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub mode: Mode,
-    /// sensor_id -> routing_key（リアルタイムのバインド/検証に使用）。
-    pub sensors: HashMap<u16, String>,
-    /// routing_key -> sensor_id（受信時の逆引き）。
-    pub routing_to_sensor: HashMap<String, u16>,
+    /// 宣言済みセンサー集合（AMQP バインド・未宣言検出・再計算のファイル列挙に使用）。
+    pub sensors: Vec<SensorId>,
     pub amqp_url: Option<String>,
     pub db_url: String,
     pub block_size_ms: u32,
@@ -92,22 +92,16 @@ impl Config {
     pub fn from_cli(cli: Cli) -> Result<Self> {
         validate_block_size(cli.block_size_ms)?;
 
-        let mut sensors = HashMap::new();
-        let mut routing_to_sensor = HashMap::new();
+        let mut sensors = Vec::new();
+        let mut seen = HashSet::new();
         for spec in &cli.sensors {
-            let (id_str, key) = spec
-                .split_once(':')
-                .with_context(|| format!("invalid --sensors entry (expected id:key): {spec}"))?;
-            let id: u16 = id_str
-                .parse()
-                .with_context(|| format!("invalid sensor id: {id_str}"))?;
-            // 重複は silent last-wins で双方向マップが非対称になるためエラー。
-            if sensors.insert(id, key.to_string()).is_some() {
-                bail!("duplicate sensor id in --sensors: {id}");
+            let id = SensorId::from_ascii(spec.as_bytes()).with_context(|| {
+                format!("invalid --sensors entry (expected 2 uppercase letters + 2 digits): {spec}")
+            })?;
+            if !seen.insert(id) {
+                bail!("duplicate sensor in --sensors: {spec}");
             }
-            if routing_to_sensor.insert(key.to_string(), id).is_some() {
-                bail!("duplicate routing key in --sensors: {key}");
-            }
+            sensors.push(id);
         }
         if sensors.is_empty() {
             bail!("--sensors must declare at least one sensor");
@@ -147,7 +141,6 @@ impl Config {
         Ok(Config {
             mode: cli.mode,
             sensors,
-            routing_to_sensor,
             amqp_url: cli.amqp_url,
             db_url: cli.db_url,
             block_size_ms: cli.block_size_ms,
@@ -230,7 +223,7 @@ mod tests {
     fn base_cli() -> Cli {
         Cli {
             mode: Mode::Realtime,
-            sensors: vec!["1:a".into(), "2:b".into()],
+            sensors: vec!["AB01".into(), "AB02".into()],
             amqp_url: Some("amqp://localhost".into()),
             db_url: "postgres://localhost/adsbx".into(),
             block_size_ms: 1000,
@@ -248,16 +241,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_sensor_id() {
+    fn rejects_duplicate_sensor() {
         let mut cli = base_cli();
-        cli.sensors = vec!["1:a".into(), "1:b".into()];
+        cli.sensors = vec!["AB01".into(), "AB01".into()];
         assert!(Config::from_cli(cli).is_err());
     }
 
     #[test]
-    fn rejects_duplicate_routing_key() {
+    fn rejects_malformed_sensor_code() {
         let mut cli = base_cli();
-        cli.sensors = vec!["1:a".into(), "2:a".into()];
+        cli.sensors = vec!["ab01".into()]; // 小文字は規約外
+        assert!(Config::from_cli(cli).is_err());
+        let mut cli = base_cli();
+        cli.sensors = vec!["AB1".into()]; // 3 文字
         assert!(Config::from_cli(cli).is_err());
     }
 

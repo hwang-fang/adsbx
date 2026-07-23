@@ -1,26 +1,32 @@
-//! 腐敗防止層: AMQP / ファイルの生バイト列を内部ドメインモデルへ変換する。
+//! 腐敗防止層: MQ / ファイルの生バイト列を内部ドメインモデルへ変換する。
 //!
-//! バイナリフォーマットへの依存はこのモジュールに完全に閉じ込める。後続パイプラインは
-//! [`RawSensorEvent`] / [`ModeSFrame`] のみを扱う。
+//! バイナリフォーマット（レコード構造・ヘッダ・波高値エンコード・ファイル名規則）への
+//! 依存はこのモジュールに完全に閉じ込める。後続パイプラインは [`RawSensorEvent`] /
+//! [`ModeSFrame`] のみを扱う。
 //!
-//! NOTE: AMQP の実バイナリ仕様は暫定。ここで定義する枠組みは差し替え前提であり、
-//! 変更時の影響範囲をこのファイルに限定する。
+//! フレーミング（リトルエンディアン）:
 //!
-//! 暫定フレーミング（リトルエンディアン）:
-//!
-//! * AMQP body: `[timestamp_100ns: i64][rssi_dbm: i16][payload: 14B]` = 24 バイト。
-//!   sensor_id は routing key から取得する。
-//! * ファイル record: `[sensor_id: u16][timestamp_100ns: i64][rssi_dbm: i16][payload: 14B]` = 26 バイト。
-//!   再計算時はセンサー識別子も保存する。
+//! * **固定長レコード（20B）** — MQ・ファイル共通:
+//!   `[相対時刻: u32(分内 0~599_999_999, ×100ns)][payload: 14B][波高値: u16]`
+//! * **MQ メッセージ**: `[sensor_id: ASCII 4B][時刻: ASCII 14B(%Y%m%d%H%M%S)]` = 18B の
+//!   ヘッダに、20B レコードが N 個続く（1 秒分をまとめて配送）。絶対時刻 = ヘッダを分に
+//!   切り捨てた分頭 + レコード相対時刻。
+//! * **保存ファイル**: `{時刻:%Y%m%d%H%M}{sensor_id}.spkx`。中身はヘッダ無しの 20B レコード列。
+//!   sensor_id・分頭はファイル名から得る。
 //!
 //! payload は常に 14 バイト。56bit フレームは末尾 56bit がゼロ埋めされている。
 
-use crate::domain::{ModeSFrame, RawSensorEvent};
-use crate::time::Ts100ns;
+use crate::domain::{ModeSFrame, RawSensorEvent, SensorId};
+use crate::time::{from_datetime, Ts100ns};
+use chrono::{TimeZone, Utc};
 
 pub const PAYLOAD_LEN: usize = 14;
-pub const AMQP_BODY_LEN: usize = 8 + 2 + PAYLOAD_LEN; // 24
-pub const FILE_RECORD_LEN: usize = 2 + 8 + 2 + PAYLOAD_LEN; // 26
+/// 固定長レコード長（相対時刻 u32 + payload 14B + 波高値 u16）。
+pub const RECORD_LEN: usize = 4 + PAYLOAD_LEN + 2; // 20
+pub const SENSOR_ID_LEN: usize = 4;
+pub const HEADER_TS_LEN: usize = 14;
+/// MQ ヘッダ長（sensor_id 4B + 時刻 14B）。
+pub const AMQP_HEADER_LEN: usize = SENSOR_ID_LEN + HEADER_TS_LEN; // 18
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameReject {
@@ -28,6 +34,17 @@ pub enum FrameReject {
     BadLength,
     /// 短フレーム（DF<16）なのに末尾 56bit がゼロでない。
     MalformedShortFrame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+pub enum HeaderReject {
+    /// body がヘッダ長に満たない。
+    BadLength,
+    /// sensor_id が規約（英大文字2字+数字2字）外。
+    BadSensorId,
+    /// 時刻フィールドが %Y%m%d%H%M%S として解釈できない。
+    BadTimestamp,
 }
 
 /// 14 バイトのペイロードを DF 値で長さ判定し [`ModeSFrame`] へ変換する。
@@ -49,42 +66,87 @@ pub fn parse_frame(payload: &[u8; PAYLOAD_LEN]) -> Result<ModeSFrame, FrameRejec
     }
 }
 
-/// AMQP body をパースする。sensor_id は呼び出し側が routing key から与える。
-pub fn parse_amqp_body(sensor_id: u16, body: &[u8]) -> Result<RawSensorEvent, FrameReject> {
-    if body.len() != AMQP_BODY_LEN {
+/// 波高値 u16 を dBm（-255 ~ 0 の整数）へデコードする。
+///
+/// 上位 8bit が絶対値整数部のビット反転、下位 8bit が絶対値小数部のビット反転。
+/// `-1 * (65535 - value) / 256` で整数 dBm を得る（小数部は切り捨て）。
+pub fn signal_dbm(value: u16) -> i16 {
+    (-((65535 - value as i32) / 256)) as i16
+}
+
+/// 固定長レコード（20B）を絶対時刻付き [`RawSensorEvent`] へ変換する。
+/// sensor_id と分頭は MQ ヘッダ／ファイル名から与えられる。
+pub fn parse_record(
+    sensor_id: SensorId,
+    minute_start: Ts100ns,
+    buf: &[u8],
+) -> Result<RawSensorEvent, FrameReject> {
+    if buf.len() != RECORD_LEN {
         return Err(FrameReject::BadLength);
     }
-    let ts = Ts100ns(i64::from_le_bytes(body[0..8].try_into().unwrap()));
-    let rssi_dbm = i16::from_le_bytes(body[8..10].try_into().unwrap());
-    let payload: [u8; PAYLOAD_LEN] = body[10..24].try_into().unwrap();
+    let rel = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let payload: [u8; PAYLOAD_LEN] = buf[4..18].try_into().unwrap();
+    let signal = u16::from_le_bytes(buf[18..20].try_into().unwrap());
     Ok(RawSensorEvent {
         sensor_id,
-        ts,
-        rssi_dbm,
+        ts: Ts100ns(minute_start.0 + rel as i64),
+        rssi_dbm: signal_dbm(signal),
         frame: parse_frame(&payload)?,
     })
 }
 
-/// 再計算用ファイルの 1 レコードをパースする。
-pub fn parse_file_record(buf: &[u8]) -> Result<RawSensorEvent, FrameReject> {
-    if buf.len() != FILE_RECORD_LEN {
-        return Err(FrameReject::BadLength);
+/// MQ メッセージのヘッダを解析し、`(sensor_id, 分頭, レコード列スライス)` を返す。
+/// レコード列は呼び出し側が [`RECORD_LEN`] 単位で [`parse_record`] にかける。
+pub fn parse_amqp_header(body: &[u8]) -> Result<(SensorId, Ts100ns, &[u8]), HeaderReject> {
+    if body.len() < AMQP_HEADER_LEN {
+        return Err(HeaderReject::BadLength);
     }
-    let sensor_id = u16::from_le_bytes(buf[0..2].try_into().unwrap());
-    let ts = Ts100ns(i64::from_le_bytes(buf[2..10].try_into().unwrap()));
-    let rssi_dbm = i16::from_le_bytes(buf[10..12].try_into().unwrap());
-    let payload: [u8; PAYLOAD_LEN] = buf[12..26].try_into().unwrap();
-    Ok(RawSensorEvent {
-        sensor_id,
-        ts,
-        rssi_dbm,
-        frame: parse_frame(&payload)?,
-    })
+    let sensor_id =
+        SensorId::from_ascii(&body[0..SENSOR_ID_LEN]).ok_or(HeaderReject::BadSensorId)?;
+    let ts_ascii = std::str::from_utf8(&body[SENSOR_ID_LEN..AMQP_HEADER_LEN])
+        .map_err(|_| HeaderReject::BadTimestamp)?;
+    let minute_start = parse_minute(ts_ascii).ok_or(HeaderReject::BadTimestamp)?;
+    Ok((sensor_id, minute_start, &body[AMQP_HEADER_LEN..]))
+}
+
+/// `%Y%m%d%H%M%S`（14 桁 ASCII）を UTC の**分頭**（秒切り捨て）へ変換する。
+///
+/// レコードの相対時刻が分内なので、ここでは分頭のみ必要。桁を固定幅で切り出して
+/// 解析する（`%Y` の貪欲一致による連結文字列の誤読を避けるため）。
+fn parse_minute(s: &str) -> Option<Ts100ns> {
+    if s.len() != HEADER_TS_LEN || !s.is_ascii() {
+        return None;
+    }
+    let year: i32 = s[0..4].parse().ok()?;
+    let month: u32 = s[4..6].parse().ok()?;
+    let day: u32 = s[6..8].parse().ok()?;
+    let hour: u32 = s[8..10].parse().ok()?;
+    let min: u32 = s[10..12].parse().ok()?;
+    let sec: u32 = s[12..14].parse().ok()?;
+    if sec >= 60 {
+        return None;
+    }
+    // 秒は 0 に落として分頭にする。
+    let dt = Utc.with_ymd_and_hms(year, month, day, hour, min, 0).single()?;
+    Some(from_datetime(dt))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sid(s: &str) -> SensorId {
+        SensorId::from_ascii(s.as_bytes()).unwrap()
+    }
+
+    /// 20B レコードを組み立てる（相対時刻・payload・波高値）。
+    fn record(rel: u32, payload: &[u8; 14], signal: u16) -> Vec<u8> {
+        let mut b = Vec::with_capacity(RECORD_LEN);
+        b.extend_from_slice(&rel.to_le_bytes());
+        b.extend_from_slice(payload);
+        b.extend_from_slice(&signal.to_le_bytes());
+        b
+    }
 
     #[test]
     fn parses_long_frame() {
@@ -98,7 +160,6 @@ mod tests {
         let mut p = [0u8; 14];
         p[0] = 0x28; // DF=5 (0x28>>3 = 5)
         p[1] = 0xAB;
-        // bytes[7..] はゼロのまま
         match parse_frame(&p) {
             Ok(ModeSFrame::Short(s)) => assert_eq!(s[1], 0xAB),
             other => panic!("expected short, got {other:?}"),
@@ -114,31 +175,74 @@ mod tests {
     }
 
     #[test]
-    fn amqp_and_file_roundtrip_lengths() {
-        let mut body = Vec::new();
-        body.extend_from_slice(&123_456_789i64.to_le_bytes());
-        body.extend_from_slice(&(-60i16).to_le_bytes());
-        let mut payload = [0u8; 14];
-        payload[0] = 0x8D;
-        body.extend_from_slice(&payload);
-        assert_eq!(body.len(), AMQP_BODY_LEN);
-        let ev = parse_amqp_body(7, &body).unwrap();
-        assert_eq!(ev.sensor_id, 7);
-        assert_eq!(ev.ts, Ts100ns(123_456_789));
-        assert_eq!(ev.rssi_dbm, -60);
-
-        let mut rec = Vec::new();
-        rec.extend_from_slice(&9u16.to_le_bytes());
-        rec.extend_from_slice(&body);
-        assert_eq!(rec.len(), FILE_RECORD_LEN);
-        let ev2 = parse_file_record(&rec).unwrap();
-        assert_eq!(ev2.sensor_id, 9);
-        assert_eq!(ev2.ts, Ts100ns(123_456_789));
+    fn decodes_signal_dbm() {
+        // -50 dBm: value = 65535 - 50*256 = 52735
+        assert_eq!(signal_dbm(52735), -50);
+        // 端点
+        assert_eq!(signal_dbm(65535), 0);
+        assert_eq!(signal_dbm(0), -255);
     }
 
     #[test]
-    fn rejects_bad_length() {
-        assert_eq!(parse_amqp_body(1, &[0u8; 10]), Err(FrameReject::BadLength));
-        assert_eq!(parse_file_record(&[0u8; 10]), Err(FrameReject::BadLength));
+    fn parses_record_with_absolute_time() {
+        let minute = from_datetime(Utc.with_ymd_and_hms(2026, 6, 27, 12, 0, 0).unwrap());
+        let mut payload = [0u8; 14];
+        payload[0] = 0x8D;
+        let rec = record(1_000_000, &payload, 52735);
+        let ev = parse_record(sid("AB01"), minute, &rec).unwrap();
+        assert_eq!(ev.sensor_id, sid("AB01"));
+        assert_eq!(ev.ts, Ts100ns(minute.0 + 1_000_000));
+        assert_eq!(ev.rssi_dbm, -50);
+        assert!(matches!(ev.frame, ModeSFrame::Long(_)));
+    }
+
+    #[test]
+    fn parses_amqp_header_and_records() {
+        let mut payload = [0u8; 14];
+        payload[0] = 0x8D;
+        let mut body = Vec::new();
+        body.extend_from_slice(b"AB01"); // sensor_id
+        body.extend_from_slice(b"20260627120005"); // %Y%m%d%H%M%S（秒は分頭で捨てる）
+        body.extend_from_slice(&record(2_000_000, &payload, 52735));
+        body.extend_from_slice(&record(3_000_000, &payload, 52735));
+
+        let (s, minute, records) = parse_amqp_header(&body).unwrap();
+        assert_eq!(s, sid("AB01"));
+        // 12:00:05 -> 分頭 12:00:00
+        assert_eq!(
+            minute,
+            from_datetime(Utc.with_ymd_and_hms(2026, 6, 27, 12, 0, 0).unwrap())
+        );
+        assert_eq!(records.len(), 2 * RECORD_LEN);
+
+        let evs: Vec<_> = records
+            .chunks_exact(RECORD_LEN)
+            .map(|c| parse_record(s, minute, c).unwrap())
+            .collect();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].ts, Ts100ns(minute.0 + 2_000_000));
+        assert_eq!(evs[1].ts, Ts100ns(minute.0 + 3_000_000));
+    }
+
+    #[test]
+    fn rejects_bad_header() {
+        assert_eq!(parse_amqp_header(&[0u8; 10]), Err(HeaderReject::BadLength));
+        // 小文字センサー
+        let mut body = Vec::from(&b"ab01"[..]);
+        body.extend_from_slice(b"20260627120000");
+        assert_eq!(parse_amqp_header(&body), Err(HeaderReject::BadSensorId));
+        // 不正時刻
+        let mut body = Vec::from(&b"AB01"[..]);
+        body.extend_from_slice(b"20261327120000"); // 月=13
+        assert_eq!(parse_amqp_header(&body), Err(HeaderReject::BadTimestamp));
+    }
+
+    #[test]
+    fn rejects_bad_record_length() {
+        let minute = Ts100ns(0);
+        assert_eq!(
+            parse_record(sid("AB01"), minute, &[0u8; 10]),
+            Err(FrameReject::BadLength)
+        );
     }
 }

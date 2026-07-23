@@ -72,7 +72,7 @@ SQLX_OFFLINE=true cargo test    # 単体 + Engine 結合テスト（DB/ブロー
 ```sh
 cargo run --release -- \
   --mode realtime \
-  --sensors 1:sensorA,2:sensorB \
+  --sensors AB01,AB02 \
   --amqp-url "amqp://guest:guest@localhost:5672/%2f" \
   --db-url "postgres://user:pass@localhost:5432/adsb_pipeline_test" \
   --block-size-ms 1000 \
@@ -83,12 +83,12 @@ cargo run --release -- \
 
 ### 再計算モード
 
-`--data-dir` 配下の 1 分毎ファイル `YYYYMMDDHHMM.bin`（UTC）を読み、対象レンジを分単位の DELETE→INSERT で冪等に再構築します:
+`--data-dir` 配下の**センサー毎 1 分ファイル** `{YYYYMMDDHHMM}{sensor_id}.spkx`（UTC）を読み、対象レンジを分単位の DELETE→INSERT で冪等に再構築します:
 
 ```sh
 cargo run --release -- \
   --mode recompute \
-  --sensors 1:sensorA,2:sensorB \
+  --sensors AB01,AB02 \
   --db-url "postgres://user:pass@localhost:5432/adsb_pipeline_test" \
   --block-size-ms 1000 \
   --watermark-timeout-ms 1000 \
@@ -105,7 +105,7 @@ cargo run --release -- \
 | 引数 | 用途 | 既定 |
 |---|---|---|
 | `--mode realtime\|recompute` | 稼働モード | — |
-| `--sensors <id:key,...>` | 静的センサー集合（id と routing key の対応、重複不可） | — |
+| `--sensors <code,...>` | 静的センサー集合（4 文字コード `英大文字2+数字2`、例 `AB01,AB02`） | — |
 | `--amqp-url` | AMQP 接続先（realtime 必須） | — |
 | `--db-url` | PostgreSQL 接続先 | — |
 | `--block-size-ms <S>` | ダウンサンプリングブロック（`60000 % S == 0` 等の制約あり） | — |
@@ -118,12 +118,14 @@ cargo run --release -- \
 | `--data-dir` | 1 分ファイル格納ディレクトリ（recompute 必須） | — |
 | `--prefetch` | AMQP prefetch (QoS) | 1000 |
 
-### データフォーマット（暫定）
+### データフォーマット
 
-バイナリ仕様は暫定で、依存コードは `src/wire.rs`（腐敗防止層）に隔離されています。いずれもリトルエンディアン、ペイロードは 14 バイト固定（56bit フレームは末尾ゼロ埋め）:
+バイナリ仕様への依存コードは `src/wire.rs`（腐敗防止層）に隔離されています。リトルエンディアン、ペイロードは 14 バイト固定（56bit フレームは末尾ゼロ埋め）。
 
-- AMQP body（24B）: `[timestamp_100ns: i64][rssi_dbm: i16][payload: 14B]` — sensor_id は routing key 由来
-- ファイルレコード（26B）: `[sensor_id: u16][timestamp_100ns: i64][rssi_dbm: i16][payload: 14B]`
+- **固定長レコード（20B, MQ・ファイル共通）**: `[相対時刻: u32(分内 0〜599_999_999, ×100ns)][payload: 14B][波高値: u16]`
+- **MQ メッセージ**: `[sensor_id: ASCII 4B][時刻: ASCII 14B(%Y%m%d%H%M%S)]` の 18B ヘッダに 20B レコードが N 個続く（毎秒 1 通）。絶対時刻 = ヘッダを分に切り捨てた分頭 + レコードの相対時刻。
+- **保存ファイル**: `{YYYYMMDDHHMM}{sensor_id}.spkx`（センサー毎 × 1 分毎）。中身はヘッダ無しの 20B レコード列で、sensor_id・分頭はファイル名から得る。
+- **波高値**: 最大電界強度（-255〜0 dBm）。上位/下位 8bit が絶対値の整数部/小数部のビット反転で、`-1 * (65535 - value) / 256` で dBm を得る。
 
 タイムスタンプは Unix エポック起点・100ns 単位・GPS 規律 UTC です。
 

@@ -4,9 +4,10 @@
 //! AMQP は接続断時に指数バックオフで自動再接続する（DESIGN §4.0）。
 
 use crate::config::Config;
-use crate::domain::RawSensorEvent;
+use crate::domain::{RawSensorEvent, SensorId};
 use crate::metrics::Metrics;
-use crate::wire::{self, FrameReject, FILE_RECORD_LEN};
+use crate::time::Ts100ns;
+use crate::wire::{self, FrameReject, RECORD_LEN};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use lapin::options::{
@@ -107,25 +108,42 @@ async fn consume_session(
             }
         };
 
-        let routing_key = delivery.routing_key.as_str();
-        match cfg.routing_to_sensor.get(routing_key) {
-            Some(&sensor_id) => match wire::parse_amqp_body(sensor_id, &delivery.data) {
+        // ヘッダを解析し sensor_id・分頭・レコード列を得る。
+        let (sensor_id, minute_start, records) = match wire::parse_amqp_header(&delivery.data) {
+            Ok(parts) => parts,
+            Err(reject) => {
+                warn!("malformed AMQP header: {reject:?}");
+                Metrics::incr(&metrics.parse_error);
+                let _ = delivery.ack(BasicAckOptions::default()).await;
+                continue;
+            }
+        };
+        if !cfg.sensors.contains(&sensor_id) {
+            Metrics::incr(&metrics.unknown_sensor);
+            let _ = delivery.ack(BasicAckOptions::default()).await;
+            continue;
+        }
+
+        // ヘッダ受理時点で ack（取りこぼし許容・重複は UPSERT が吸収）。
+        let _ = delivery.ack(BasicAckOptions::default()).await;
+
+        let mut chunks = records.chunks_exact(RECORD_LEN);
+        for chunk in &mut chunks {
+            match wire::parse_record(sensor_id, minute_start, chunk) {
                 Ok(ev) => {
-                    // 変換・投入できた時点で ack（取りこぼし許容・重複は UPSERT が吸収）。
-                    let _ = delivery.ack(BasicAckOptions::default()).await;
                     if tx.send(ev).await.is_err() {
                         return Ok(SessionEnd::InputClosed);
                     }
                 }
-                Err(reject) => {
-                    count_frame_reject(metrics, reject);
-                    let _ = delivery.ack(BasicAckOptions::default()).await;
-                }
-            },
-            None => {
-                Metrics::incr(&metrics.unknown_sensor);
-                let _ = delivery.ack(BasicAckOptions::default()).await;
+                Err(reject) => count_frame_reject(metrics, reject),
             }
+        }
+        if !chunks.remainder().is_empty() {
+            warn!(
+                "AMQP message from {sensor_id} has {} trailing bytes (not a multiple of {})",
+                chunks.remainder().len(),
+                RECORD_LEN
+            );
         }
     }
     Ok(SessionEnd::ConnectionLost)
@@ -164,7 +182,10 @@ async fn declare_topology(channel: &lapin::Channel, cfg: &Config) -> Result<()> 
         .await
         .context("queue_declare")?;
 
-    for routing_key in cfg.routing_to_sensor.keys() {
+    // routing key = センサーコード（sensor_id はメッセージヘッダから得るが、
+    // 配送のため各センサーコードで束縛する）。
+    for sensor in &cfg.sensors {
+        let routing_key = sensor.as_str();
         channel
             .queue_bind(
                 QUEUE,
@@ -177,15 +198,21 @@ async fn declare_topology(channel: &lapin::Channel, cfg: &Config) -> Result<()> 
             .with_context(|| format!("queue_bind {routing_key}"))?;
     }
 
-    let mut keys: Vec<&String> = cfg.routing_to_sensor.keys().collect();
+    let mut keys: Vec<String> = cfg.sensors.iter().map(|s| s.to_string()).collect();
     keys.sort();
     info!("declared AMQP topology: exchange={EXCHANGE} queue={QUEUE} bindings={keys:?}");
     Ok(())
 }
 
-/// 1 分ファイル（生バイト列ログ）を読み、パース済みイベント列を返す。
+/// センサー毎 1 分ファイル（`{分}{sensor_id}.spkx`）を読み、パース済みイベント列を返す。
+/// sensor_id・分頭はファイル名由来なので呼び出し側が与える。
 /// ファイルが存在しない場合は警告して空を返す（欠損スキップ）。
-pub async fn read_minute_file(path: &Path, metrics: &Metrics) -> Result<Vec<RawSensorEvent>> {
+pub async fn read_sensor_minute_file(
+    path: &Path,
+    sensor_id: SensorId,
+    minute_start: Ts100ns,
+    metrics: &Metrics,
+) -> Result<Vec<RawSensorEvent>> {
     let data = match tokio::fs::read(path).await {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -195,18 +222,18 @@ pub async fn read_minute_file(path: &Path, metrics: &Metrics) -> Result<Vec<RawS
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
 
-    if data.len() % FILE_RECORD_LEN != 0 {
+    if data.len() % RECORD_LEN != 0 {
         warn!(
             "file {} length {} is not a multiple of record size {}",
             path.display(),
             data.len(),
-            FILE_RECORD_LEN
+            RECORD_LEN
         );
     }
 
-    let mut events = Vec::with_capacity(data.len() / FILE_RECORD_LEN);
-    for chunk in data.chunks_exact(FILE_RECORD_LEN) {
-        match wire::parse_file_record(chunk) {
+    let mut events = Vec::with_capacity(data.len() / RECORD_LEN);
+    for chunk in data.chunks_exact(RECORD_LEN) {
+        match wire::parse_record(sensor_id, minute_start, chunk) {
             Ok(ev) => events.push(ev),
             Err(reject) => count_frame_reject(metrics, reject),
         }
