@@ -314,7 +314,7 @@
 | `fn run_recompute(cfg, metrics)` | 再計算（3 フェーズ・ストリーミング書き込み） |
 | `fn read_minute_all_sensors` | 指定分の全センサーファイルを読み ts でマージソート |
 | `fn collect` / `fn write_ready_minutes` | 分バケット蓄積と確定分の順次書き出し |
-| `fn minute_path(dir, dt, sensor)` | `{分}{sensor}.spkx` パス生成 |
+| `fn minute_path(dir, template, dt, sensor)` | パステンプレートを展開してファイルパス生成 |
 
 **重要ポイント**
 - **リアルタイム**: receiver タスク（AMQP→`tx_in`）と writer タスク（`rx_db`→UPSERT）を spawn し、メインループが `select!` で「イベント受信 → `engine.process`」「ドレイン tick → `advance_wallclock`」「Ctrl-C」を捌く。終了時は receiver を止め、`engine.finish()` の残存行を writer に流してからドレイン。
@@ -324,6 +324,7 @@
   2. **フェーズ2**: 1 分前の全センサーファイルを `engine.process` に流して CPR/dedup を温める。出力は `collect` の `[from, to)` フィルタで自然に捨てられる（明示的な MUTE フラグ不要）。
   3. **フェーズ3**: 対象レンジを 1 分ずつ投入し、**各分の投入後に `write_ready_minutes`** — 分終端 ≦ `engine.confirmed()` になった分から順次 `recompute_minute`（DELETE→INSERT）してバケットから除去。
 - **センサー毎ファイルのマージ**: 入力がセンサー毎 `.spkx` に分割されたため、`read_minute_all_sensors` が 1 分ぶんの全センサーファイルを読み、**絶対時刻でソート**してから投入します。センサー間で時刻が前後してもウォーターマークの単調性（遅延イベントの `dropped_late` 誤破棄）を防ぐためです。
+- **パステンプレート**（`minute_path`）: 実データは `{YYYYMM}/{sensor}/{YYYYMMDD}/spkx/{分}{sensor}.spkx` のような入れ子配置。`--data-path-template`（`--data-dir` からの相対）で柔軟に指定します。`{sensor}` をセンサーコードへ置換した後、chrono の **strftime**（`%Y%m%d%H%M` 等）で対象分の UTC 日時を展開。既定はフラット配置 `%Y%m%d%H%M{sensor}.spkx`。テンプレートの strftime 妥当性は起動時（`config`）に検証済みなので、`minute_path` は `format().to_string()` で安全に展開できます。
 - **ストリーミング書き込みの保証**: ブロックは分境界を跨がない（config 保証）＋確定ウォーターマーク以前のブロックは排出済み（Engine 保証）なので、「分終端 ≦ confirmed」ならその分の全行が揃っています。メモリはウォーターマーク遅延分に有界で、途中失敗しても書き込み済みの分は完結（再実行は冪等）。
 - 終端は `engine.finish()` を回収後、`Ts100ns::MAX` で残り全分を書く（**欠損分の DELETE 含む**）。
 

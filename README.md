@@ -83,20 +83,23 @@ cargo run --release -- \
 
 ### 再計算モード
 
-`--data-dir` 配下の**センサー毎 1 分ファイル** `{YYYYMMDDHHMM}{sensor_id}.spkx`（UTC）を読み、対象レンジを分単位の DELETE→INSERT で冪等に再構築します:
+`--data-dir` をルートに、**センサー毎 1 分ファイル**を読み、対象レンジを分単位の DELETE→INSERT で冪等に再構築します。ファイル配置は `--data-path-template`（`--data-dir` からの相対）で柔軟に指定できます:
 
 ```sh
 cargo run --release -- \
   --mode recompute \
-  --sensors AB01,AB02 \
+  --sensors KX00,KX90 \
   --db-url "postgres://user:pass@localhost:5432/adsb_pipeline_test" \
   --block-size-ms 1000 \
   --watermark-timeout-ms 1000 \
-  --recompute-from 2026-06-27T12:00:00Z \
-  --recompute-to   2026-06-27T12:10:00Z \
+  --recompute-from 2026-06-10T00:00:00Z \
+  --recompute-to   2026-06-10T00:10:00Z \
   --restore-lookback-seconds 300 \
-  --data-dir /path/to/minute-files
+  --data-dir /path/to/samples \
+  --data-path-template '%Y%m/{sensor}/%Y%m%d/spkx/%Y%m%d%H%M{sensor}.spkx'
 ```
+
+**パステンプレート**は `{sensor}`（センサーコードへ置換）と chrono の strftime 指定子（`%Y %m %d %H %M` を対象分の UTC 日時へ展開）で構成します。既定はフラット配置 `%Y%m%d%H%M{sensor}.spkx`。拡張子違い（`qpkx` 等）や別の入れ子構造もテンプレートを変えるだけで対応できます。
 
 開始前に DB から機体メタデータを復元し、開始 1 分前のファイルで CPR / 重複排除のメモリ状態を温めてから本処理に入ります（ウォームアップの詳細は DESIGN §5）。欠損ファイルは警告してスキップされ、その分は DELETE のみ実行されます。
 
@@ -115,7 +118,8 @@ cargo run --release -- \
 | `--surface-ref-lat` / `--surface-ref-lon` | 地上 CPR 参照座標（両方同時指定） | — |
 | `--recompute-from` / `--recompute-to` | 再計算レンジ（UTC・分境界必須） | — |
 | `--restore-lookback-seconds` | 状態復元の遡及秒数 | 0 |
-| `--data-dir` | 1 分ファイル格納ディレクトリ（recompute 必須） | — |
+| `--data-dir` | 1 分ファイル格納ルート（recompute 必須） | — |
+| `--data-path-template` | `--data-dir` からの相対パステンプレート（`{sensor}` + strftime） | `%Y%m%d%H%M{sensor}.spkx` |
 | `--prefetch` | AMQP prefetch (QoS) | 1000 |
 
 ### データフォーマット

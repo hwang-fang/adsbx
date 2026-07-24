@@ -149,6 +149,7 @@ mod tests {
             recompute_to: None,
             restore_lookback_seconds: 0,
             data_dir: None,
+            data_path_template: "%Y%m%d%H%M{sensor}.spkx".into(),
             prefetch: 1000,
         }
     }

@@ -2,6 +2,7 @@
 
 use crate::domain::SensorId;
 use anyhow::{bail, Context, Result};
+use chrono::format::{Item, StrftimeItems};
 use chrono::{DateTime, Timelike, Utc};
 use clap::{Parser, ValueEnum};
 use std::collections::HashSet;
@@ -59,9 +60,16 @@ pub struct Cli {
     #[arg(long, default_value_t = 0)]
     pub restore_lookback_seconds: u64,
 
-    /// 生バイトログの格納ディレクトリ（再計算時）。
+    /// 生バイトログの格納ディレクトリ（再計算時のルート）。
     #[arg(long)]
     pub data_dir: Option<String>,
+
+    /// 再計算のファイルパステンプレート（`--data-dir` からの相対）。
+    /// `{sensor}` はセンサーコードに、chrono の strftime 指定子（`%Y %m %d %H %M` 等）は
+    /// 対象分の UTC 日時に展開される。
+    /// 例（入れ子配置）: `%Y%m/{sensor}/%Y%m%d/spkx/%Y%m%d%H%M{sensor}.spkx`
+    #[arg(long, default_value = "%Y%m%d%H%M{sensor}.spkx")]
+    pub data_path_template: String,
 
     /// AMQP prefetch (QoS)。
     #[arg(long, default_value_t = 1000)]
@@ -85,12 +93,14 @@ pub struct Config {
     pub recompute_to: Option<DateTime<Utc>>,
     pub restore_lookback_seconds: u64,
     pub data_dir: Option<String>,
+    pub data_path_template: String,
     pub prefetch: u16,
 }
 
 impl Config {
     pub fn from_cli(cli: Cli) -> Result<Self> {
         validate_block_size(cli.block_size_ms)?;
+        validate_path_template(&cli.data_path_template)?;
 
         let mut sensors = Vec::new();
         let mut seen = HashSet::new();
@@ -152,9 +162,21 @@ impl Config {
             recompute_to: cli.recompute_to,
             restore_lookback_seconds: cli.restore_lookback_seconds,
             data_dir: cli.data_dir,
+            data_path_template: cli.data_path_template,
             prefetch: cli.prefetch,
         })
     }
+}
+
+/// 再計算のパステンプレートを検証する。`{sensor}` を除去した後、chrono の strftime
+/// 指定子として解釈できることを確認する（不正指定子は起動時に弾く）。
+fn validate_path_template(template: &str) -> Result<()> {
+    // {sensor} はダミーコードに置換（strftime とは無関係な純リテラル）。
+    let probe = template.replace("{sensor}", "XX00");
+    if StrftimeItems::new(&probe).any(|item| matches!(item, Item::Error)) {
+        bail!("invalid --data-path-template (bad strftime specifier): {template}");
+    }
+    Ok(())
 }
 
 /// 再計算レンジが分境界（秒・サブ秒 = 0）であることを検証する。
@@ -236,6 +258,7 @@ mod tests {
             recompute_to: None,
             restore_lookback_seconds: 0,
             data_dir: None,
+            data_path_template: "%Y%m%d%H%M{sensor}.spkx".into(),
             prefetch: 1000,
         }
     }
@@ -279,5 +302,17 @@ mod tests {
     fn accepts_minute_aligned_recompute_range() {
         let cli = recompute_cli("2026-06-27T12:00:00Z", "2026-06-27T12:05:00Z");
         assert!(Config::from_cli(cli).is_ok());
+    }
+
+    #[test]
+    fn accepts_valid_path_templates() {
+        assert!(validate_path_template("%Y%m%d%H%M{sensor}.spkx").is_ok());
+        assert!(validate_path_template("%Y%m/{sensor}/%Y%m%d/spkx/%Y%m%d%H%M{sensor}.spkx").is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_path_template() {
+        // %Q は不正な strftime 指定子。
+        assert!(validate_path_template("%Q/{sensor}.spkx").is_err());
     }
 }

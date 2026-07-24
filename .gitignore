@@ -1,2 +1,5 @@
 /target
 .env
+
+# 実測データ（大容量・非追跡）
+/samples

@@ -178,7 +178,9 @@ pub async fn run_recompute(cfg: Config, metrics: Arc<Metrics>) -> Result<()> {
 
     // フェーズ2: 1 分前ファイルでメモリ状態を温める（出力は範囲外のため自然に MUTE）。
     let pre = from - ChronoDuration::minutes(1);
-    let events = read_minute_all_sensors(&data_dir, pre, &cfg.sensors, &metrics).await?;
+    let events =
+        read_minute_all_sensors(&data_dir, &cfg.data_path_template, pre, &cfg.sensors, &metrics)
+            .await?;
     let n2 = events.len();
     for ev in events {
         collect(&mut buckets, engine.process(ev), from, to);
@@ -188,7 +190,9 @@ pub async fn run_recompute(cfg: Config, metrics: Arc<Metrics>) -> Result<()> {
     // フェーズ3: 対象レンジを 1 分ずつ投入し、確定した分から順次書き込む。
     let mut m = from;
     while m < to {
-        let events = read_minute_all_sensors(&data_dir, m, &cfg.sensors, &metrics).await?;
+        let events =
+            read_minute_all_sensors(&data_dir, &cfg.data_path_template, m, &cfg.sensors, &metrics)
+                .await?;
         let n = events.len();
         for ev in events {
             collect(&mut buckets, engine.process(ev), from, to);
@@ -218,6 +222,7 @@ pub async fn run_recompute(cfg: Config, metrics: Arc<Metrics>) -> Result<()> {
 /// Engine へ投入する前に時刻順へ整える。
 async fn read_minute_all_sensors(
     dir: &std::path::Path,
+    template: &str,
     minute: DateTime<Utc>,
     sensors: &[SensorId],
     metrics: &Metrics,
@@ -225,7 +230,7 @@ async fn read_minute_all_sensors(
     let minute_start = time::from_datetime(minute);
     let mut events = Vec::new();
     for &sensor in sensors {
-        let path = minute_path(dir, minute, sensor);
+        let path = minute_path(dir, template, minute, sensor);
         events.extend(
             receiver::read_sensor_minute_file(&path, sensor, minute_start, metrics).await?,
         );
@@ -278,8 +283,12 @@ fn minute_key(dt: DateTime<Utc>) -> i64 {
     dt.timestamp().div_euclid(60)
 }
 
-fn minute_path(dir: &std::path::Path, dt: DateTime<Utc>, sensor: SensorId) -> PathBuf {
-    dir.join(format!("{}{}.spkx", fmt_minute(dt), sensor))
+/// テンプレートを展開して `--data-dir` からの相対パスを組む。
+/// `{sensor}` をセンサーコードへ置換した後、chrono の strftime で日時を展開する。
+/// （テンプレートの strftime 妥当性は `Config::from_cli` で検証済み。）
+fn minute_path(dir: &std::path::Path, template: &str, dt: DateTime<Utc>, sensor: SensorId) -> PathBuf {
+    let with_sensor = template.replace("{sensor}", sensor.as_str());
+    dir.join(dt.format(&with_sensor).to_string())
 }
 
 fn fmt_minute(dt: DateTime<Utc>) -> String {
@@ -291,4 +300,37 @@ fn fmt_minute(dt: DateTime<Utc>) -> String {
         dt.hour(),
         dt.minute()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::path::Path;
+
+    fn sid(s: &str) -> SensorId {
+        SensorId::from_ascii(s.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn minute_path_flat_default() {
+        let dt = Utc.with_ymd_and_hms(2026, 6, 10, 5, 51, 0).unwrap();
+        let p = minute_path(Path::new("/data"), "%Y%m%d%H%M{sensor}.spkx", dt, sid("KX00"));
+        assert_eq!(p, Path::new("/data/202606100551KX00.spkx"));
+    }
+
+    #[test]
+    fn minute_path_nested_template() {
+        let dt = Utc.with_ymd_and_hms(2026, 6, 10, 5, 51, 0).unwrap();
+        let p = minute_path(
+            Path::new("samples"),
+            "%Y%m/{sensor}/%Y%m%d/spkx/%Y%m%d%H%M{sensor}.spkx",
+            dt,
+            sid("KX00"),
+        );
+        assert_eq!(
+            p,
+            Path::new("samples/202606/KX00/20260610/spkx/202606100551KX00.spkx")
+        );
+    }
 }
