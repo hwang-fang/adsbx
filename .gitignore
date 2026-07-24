@@ -3,3 +3,11 @@
 
 # 実測データ（大容量・非追跡）
 /samples
+
+# 座標ビューア (Python/Jupyter) の venv・生成物
+/tools/coord_viewer/.venv/
+/tools/coord_viewer/executed_*.ipynb
+tools/coord_viewer/**/__pycache__/
+
+# 生成物サンプル（追跡しない）
+/tools/coord_viewer/map_output.png

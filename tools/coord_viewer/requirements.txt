@@ -1,0 +1,26 @@
+# adsbx 座標ビューア 依存パッケージ（実際に検証した構成に固定）
+# Python 3.12 / venv 前提。導入手順は README.md を参照。
+
+# --- データ処理・地理空間 ---
+geopandas==1.1.4
+shapely==2.1.2
+pyproj==3.7.2
+pandas==3.0.5
+numpy==2.5.1
+
+# --- DB 接続（SQLAlchemy + psycopg3。バイナリ版でビルド不要） ---
+SQLAlchemy==2.0.51
+psycopg[binary]==3.3.4
+
+# --- 設定読み込み（.env の DATABASE_URL を読む） ---
+python-dotenv==1.2.2
+
+# --- 可視化 ---
+matplotlib==3.11.1
+contextily==1.7.1
+
+# --- Jupyter 実行環境 ---
+jupyter==1.1.1
+ipykernel==7.3.0
+nbconvert==7.17.1
+nbformat==5.10.4
